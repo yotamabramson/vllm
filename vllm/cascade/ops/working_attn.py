@@ -12,9 +12,15 @@ working pages (same physical pages for every head, different contents):
 Slots in between are unwritten and get no weight. Attention is order-invariant
 over keys (K is stored post-RoPE), so slot order does not matter.
 
-Softmax is accumulated page by page relative to a running max (the same
-pattern as MiniMax-M3's sparse decode kernel), with guards so a page with no
-valid slot contributes nothing.
+GPU parallelism: every (request, page chunk, KV head) is its own Triton program.
+Each writes its chunk's softmax-weighted value average and log-sum-exp; torch
+then merges chunks with softmax weights over those log-sum-exps (same split as
+MiniMax-M3's chunked decode kernel). Measured on an RTX 4070 SUPER, llama3.1-8b
+geometry, margin-0.3 working set: looping all pages inside one program per
+request/head cost 16.6 ms/layer; element-wise products inside per-page programs
+were no better; tl.dot products brought it to 0.27 ms/layer. Chunks are 64
+slots because full-precision tl.dot over a whole 128-slot page exceeds the
+per-program GPU shared-memory limit.
 
 Imports nothing from vLLM (torch + Triton only).
 
@@ -31,52 +37,58 @@ import torch
 import triton
 import triton.language as tl
 
+SUB_CHUNK = 64
+
 
 @triton.jit
-def _working_attn_decode_kernel(
-    Q, KV, BT, A_END, B_END, O,
+def _working_attn_chunk_kernel(
+    Q, KV, BT, A_END, B_END, LSE, OUT,
     stride_q_r, stride_q_h, stride_q_d,
     stride_kv_b, stride_kv_h, stride_kv_t, stride_kv_d,
     stride_bt_r,
     stride_be_r, stride_be_h,
-    stride_o_r, stride_o_h, stride_o_d,
-    b_start, scale,
-    D: tl.constexpr, N_REP: tl.constexpr, BS: tl.constexpr,
+    stride_l_r, stride_l_c, stride_l_h,
+    stride_o_r, stride_o_c, stride_o_h, stride_o_d,
+    b_start, scale, n_pages,
+    D: tl.constexpr, N_REP: tl.constexpr, BS: tl.constexpr, SUB: tl.constexpr, NSUB: tl.constexpr,
 ):
-    r = tl.program_id(0).to(tl.int64)
+    pid0 = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1).to(tl.int64)
+    c = pid0 % NSUB
+    rp = pid0 // NSUB
+    pg = rp % n_pages
+    r = rp // n_pages
     a_end = tl.load(A_END + r).to(tl.int64)
     b_end = tl.load(B_END + r * stride_be_r + h * stride_be_h).to(tl.int64)
-    end = tl.maximum(a_end, b_end)
-    num_pages = (end + BS - 1) // BS
 
     reps = tl.arange(0, N_REP).to(tl.int64)
     dims = tl.arange(0, D).to(tl.int64)
-    offs = tl.arange(0, BS).to(tl.int64)
+    offs = c * SUB + tl.arange(0, SUB).to(tl.int64)
     q_heads = h * N_REP + reps
+    slot = pg * BS + offs
+    valid = (slot < a_end) | ((slot >= b_start) & (slot < b_end))
+
+    page = tl.load(BT + r * stride_bt_r + pg).to(tl.int64)
     q = tl.load(Q + r * stride_q_r + q_heads[:, None] * stride_q_h + dims[None, :] * stride_q_d).to(tl.float32)
+    base = KV + page * stride_kv_b + h * stride_kv_h
+    # K as [D, SUB] and V as [SUB, D] so both products are tl.dot (fused matmul).
+    k = tl.load(base + offs[None, :] * stride_kv_t + dims[:, None] * stride_kv_d,
+                mask=valid[None, :], other=0.0).to(tl.float32)                        # [D, SUB]
+    v = tl.load(base + offs[:, None] * stride_kv_t + (D + dims[None, :]) * stride_kv_d,
+                mask=valid[:, None], other=0.0).to(tl.float32)                        # [SUB, D]
 
-    m = tl.full((N_REP,), float("-inf"), tl.float32)     # running max logit
-    wsum = tl.zeros((N_REP,), tl.float32)                 # sum exp(logit - m)
-    acc = tl.zeros((N_REP, D), tl.float32)                # sum exp(logit - m) * v
-    for pg in range(0, num_pages):
-        page = tl.load(BT + r * stride_bt_r + pg).to(tl.int64)
-        slot = pg * BS + offs
-        valid = (slot < a_end) | ((slot >= b_start) & (slot < b_end))
-        base = KV + page * stride_kv_b + h * stride_kv_h + offs[:, None] * stride_kv_t
-        k = tl.load(base + dims[None, :] * stride_kv_d, mask=valid[:, None], other=0.0).to(tl.float32)
-        v = tl.load(base + (D + dims[None, :]) * stride_kv_d, mask=valid[:, None], other=0.0).to(tl.float32)
-        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale                    # [N_REP, BS]
-        s = tl.where(valid[None, :], s, float("-inf"))
-        m_new = tl.maximum(m, tl.max(s, axis=1))
-        ratio = tl.where(m > float("-inf"), tl.exp(m - m_new), 0.0)
-        p = tl.where(valid[None, :], tl.exp(s - m_new[:, None]), 0.0)                # [N_REP, BS]
-        acc = acc * ratio[:, None] + tl.sum(p[:, :, None] * v[None, :, :], axis=1)
-        wsum = wsum * ratio + tl.sum(p, axis=1)
-        m = m_new
+    s = tl.dot(q, k, input_precision="ieee") * scale                                  # [N_REP, SUB]
+    s = tl.where(valid[None, :], s, float("-inf"))
+    m = tl.max(s, axis=1)
+    safe_m = tl.where(m > float("-inf"), m, 0.0)
+    p = tl.where(valid[None, :], tl.exp(s - safe_m[:, None]), 0.0)
+    wsum = tl.sum(p, axis=1)
+    lse = tl.where(wsum > 0, safe_m + tl.log(wsum), float("-inf"))
+    avg = tl.dot(p, v, input_precision="ieee") / tl.maximum(wsum, 1e-30)[:, None]      # [N_REP, D]
 
-    out = acc / tl.maximum(wsum, 1e-30)[:, None]
-    tl.store(O + r * stride_o_r + q_heads[:, None] * stride_o_h + dims[None, :] * stride_o_d, out)
+    chunk = pg * NSUB + c
+    tl.store(LSE + r * stride_l_r + chunk * stride_l_c + q_heads * stride_l_h, lse)
+    tl.store(OUT + r * stride_o_r + chunk * stride_o_c + q_heads[:, None] * stride_o_h + dims[None, :] * stride_o_d, avg)
 
 
 def working_attn_decode(
@@ -88,23 +100,36 @@ def working_attn_decode(
     b_end: torch.Tensor,
     output: torch.Tensor,
     scale: float,
+    max_slots: int | None = None,
 ) -> None:
+    """max_slots (CPU int, >= every a_end and b_end) avoids a device sync when given."""
     R, Hq, D = q.shape
     _, Hkv, BS, D2 = kv_cache.shape
     assert D2 == 2 * D and Hq % Hkv == 0 and b_end.shape == (R, Hkv)
     assert block_table.stride(1) == 1 and output.shape == q.shape
     if R == 0:
         return
-    _working_attn_decode_kernel[(R, Hkv)](
-        q, kv_cache, block_table, a_end, b_end, output,
+    if max_slots is None:
+        max_slots = max(int(a_end.max()), int(b_end.max()))
+    n_pages = (max_slots + BS - 1) // BS
+    sub = min(SUB_CHUNK, BS)
+    assert BS % sub == 0
+    nsub = BS // sub
+    lse = torch.empty(R, n_pages * nsub, Hq, dtype=torch.float32, device=q.device)
+    avg = torch.empty(R, n_pages * nsub, Hq, D, dtype=torch.float32, device=q.device)
+    _working_attn_chunk_kernel[(R * n_pages * nsub, Hkv)](
+        q, kv_cache, block_table, a_end, b_end, lse, avg,
         q.stride(0), q.stride(1), q.stride(2),
         kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), kv_cache.stride(3),
         block_table.stride(0),
         b_end.stride(0), b_end.stride(1),
-        output.stride(0), output.stride(1), output.stride(2),
-        b_start, scale,
-        D=D, N_REP=Hq // Hkv, BS=BS,
+        lse.stride(0), lse.stride(1), lse.stride(2),
+        avg.stride(0), avg.stride(1), avg.stride(2), avg.stride(3),
+        b_start, scale, n_pages,
+        D=D, N_REP=Hq // Hkv, BS=BS, SUB=sub, NSUB=nsub,
     )
+    weights = torch.softmax(lse, dim=1)                                               # over chunks
+    output.copy_(torch.einsum("rch,rchd->rhd", weights, avg))
 
 
 def working_attn_decode_reference(q, kv_cache, block_table, a_end, b_start, b_end, output, scale) -> None:

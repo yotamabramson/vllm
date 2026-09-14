@@ -12,6 +12,13 @@ p vectors and averages them at refresh; a running sum reset at every refresh is
 the same set of steps, and dividing by the window length does not change top-K,
 so only the sum is kept.
 
+GPU parallelism: every (request, 128-token chunk, KV head) is its own Triton
+program. A first pass writes each chunk's log-sum-exp, torch combines them per
+request/head/query head, and a second pass adds the probabilities into the
+accumulator. (A first version looped over the whole context inside one program
+per request/head: correct, but ~1000x too slow -- a Triton program is a single
+GPU thread.)
+
 Deliberately imports nothing from vLLM (torch + Triton only), so it can be
 tested against the reference below on any CUDA machine.
 
@@ -31,59 +38,76 @@ import torch
 import triton
 import triton.language as tl
 
+SUB_CHUNK = 128
+
 
 @triton.jit
-def _thin_score_decode_kernel(
-    Q, K_CACHE, K_BT, ACC, ACC_BT, SEQ_LENS,
-    stride_q_r, stride_q_h,
-    stride_k_b, stride_k_t,
-    stride_kbt_r,
-    stride_a_b, stride_a_t,
-    stride_abt_r,
-    scale,
-    W: tl.constexpr, N_REP: tl.constexpr, BS_K: tl.constexpr, BS_A: tl.constexpr,
-):
-    r = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1).to(tl.int64)
+def _chunk_scores(Q, K_CACHE, K_BT, SEQ_LENS, pid0, h,
+                  stride_q_r, stride_q_h, stride_k_b, stride_k_t, stride_kbt_r,
+                  scale, n_blocks, W: tl.constexpr, N_REP: tl.constexpr, BS_K: tl.constexpr,
+                  SUB: tl.constexpr, NSUB: tl.constexpr):
+    c = pid0 % NSUB
+    rb = pid0 // NSUB
+    b = rb % n_blocks
+    r = rb // n_blocks
     n = tl.load(SEQ_LENS + r).to(tl.int64)
-    num_blocks = (n + BS_K - 1) // BS_K
-
     reps = tl.arange(0, N_REP).to(tl.int64)
     dims = tl.arange(0, W).to(tl.int64)
-    offs = tl.arange(0, BS_K).to(tl.int64)
-
-    # The group's query heads: h * n_rep + rep -> [N_REP, W]
+    offs = c * SUB + tl.arange(0, SUB).to(tl.int64)
+    pos = b * BS_K + offs
+    tok = pos < n
+    phys = tl.load(K_BT + r * stride_kbt_r + b).to(tl.int64)
     q = tl.load(Q + r * stride_q_r + (h * N_REP + reps)[:, None] * stride_q_h + dims[None, :]).to(tl.float32)
+    k = tl.load(K_CACHE + phys * stride_k_b + offs[None, :] * stride_k_t + (h * W + dims)[:, None],
+                mask=tok[None, :], other=0.0).to(tl.float32)                       # [W, SUB]
+    s = tl.dot(q, k, input_precision="ieee") * scale                              # [N_REP, SUB]
+    return r, b, c, pos, tok, s
 
-    # Pass 1: log-sum-exp of the scores over all n tokens, per query head,
-    # combined block by block so no global max is needed up front.
-    lse = tl.full((N_REP,), float("-inf"), tl.float32)
-    for b in range(0, num_blocks):
-        phys = tl.load(K_BT + r * stride_kbt_r + b).to(tl.int64)
-        pos = b * BS_K + offs
-        tok = pos < n
-        k = tl.load(K_CACHE + phys * stride_k_b + offs[:, None] * stride_k_t + (h * W + dims)[None, :],
-                    mask=tok[:, None], other=0.0).to(tl.float32)              # [BS_K, W]
-        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale            # [N_REP, BS_K]
-        s = tl.where(tok[None, :], s, float("-inf"))
-        m = tl.max(s, axis=1)                                                # finite: a block always has >= 1 token
-        blse = m + tl.log(tl.sum(tl.exp(s - m[:, None]), axis=1))
-        lse = tl.maximum(lse, blse) + tl.log(1.0 + tl.exp(-tl.abs(lse - blse)))
 
-    # Pass 2: softmax probability, max over the group's query heads, add into the accumulator.
-    for b in range(0, num_blocks):
-        phys = tl.load(K_BT + r * stride_kbt_r + b).to(tl.int64)
-        pos = b * BS_K + offs
-        tok = pos < n
-        k = tl.load(K_CACHE + phys * stride_k_b + offs[:, None] * stride_k_t + (h * W + dims)[None, :],
-                    mask=tok[:, None], other=0.0).to(tl.float32)
-        s = tl.sum(q[:, None, :] * k[None, :, :], axis=2) * scale
-        s = tl.where(tok[None, :], s, float("-inf"))
-        p = tl.max(tl.exp(s - lse[:, None]), axis=0)                         # [BS_K]
-        a_phys = tl.load(ACC_BT + r * stride_abt_r + pos // BS_A, mask=tok, other=0).to(tl.int64)
-        a_ptr = ACC + a_phys * stride_a_b + (pos % BS_A) * stride_a_t + h
-        cur = tl.load(a_ptr, mask=tok, other=0.0)
-        tl.store(a_ptr, cur + p, mask=tok)
+@triton.jit
+def _score_lse_kernel(
+    Q, K_CACHE, K_BT, SEQ_LENS, LSE,
+    stride_q_r, stride_q_h, stride_k_b, stride_k_t, stride_kbt_r,
+    stride_l_r, stride_l_c, stride_l_h,
+    scale, n_blocks,
+    W: tl.constexpr, N_REP: tl.constexpr, BS_K: tl.constexpr, SUB: tl.constexpr, NSUB: tl.constexpr,
+):
+    pid0 = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    r, b, c, pos, tok, s = _chunk_scores(Q, K_CACHE, K_BT, SEQ_LENS, pid0, h,
+                                         stride_q_r, stride_q_h, stride_k_b, stride_k_t, stride_kbt_r,
+                                         scale, n_blocks, W, N_REP, BS_K, SUB, NSUB)
+    s = tl.where(tok[None, :], s, float("-inf"))
+    m = tl.max(s, axis=1)
+    safe_m = tl.where(m > float("-inf"), m, 0.0)
+    total = tl.sum(tl.where(tok[None, :], tl.exp(s - safe_m[:, None]), 0.0), axis=1)
+    lse = tl.where(total > 0, safe_m + tl.log(total), float("-inf"))
+    reps = tl.arange(0, N_REP).to(tl.int64)
+    tl.store(LSE + r * stride_l_r + (b * NSUB + c) * stride_l_c + h * stride_l_h + reps, lse)
+
+
+@triton.jit
+def _score_acc_kernel(
+    Q, K_CACHE, K_BT, SEQ_LENS, LSE, ACC, ACC_BT,
+    stride_q_r, stride_q_h, stride_k_b, stride_k_t, stride_kbt_r,
+    stride_l_r, stride_l_h,
+    stride_a_b, stride_a_t, stride_abt_r,
+    scale, n_blocks,
+    W: tl.constexpr, N_REP: tl.constexpr, BS_K: tl.constexpr, SUB: tl.constexpr, NSUB: tl.constexpr,
+    BS_A: tl.constexpr,
+):
+    pid0 = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    r, b, c, pos, tok, s = _chunk_scores(Q, K_CACHE, K_BT, SEQ_LENS, pid0, h,
+                                         stride_q_r, stride_q_h, stride_k_b, stride_k_t, stride_kbt_r,
+                                         scale, n_blocks, W, N_REP, BS_K, SUB, NSUB)
+    reps = tl.arange(0, N_REP).to(tl.int64)
+    lse = tl.load(LSE + r * stride_l_r + h * stride_l_h + reps)                   # [N_REP]
+    p = tl.max(tl.where(tok[None, :], tl.exp(s - lse[:, None]), 0.0), axis=0)    # [SUB]
+    a_phys = tl.load(ACC_BT + r * stride_abt_r + pos // BS_A, mask=tok, other=0).to(tl.int64)
+    a_ptr = ACC + a_phys * stride_a_b + (pos % BS_A) * stride_a_t + h
+    cur = tl.load(a_ptr, mask=tok, other=0.0)
+    tl.store(a_ptr, cur + p, mask=tok)
 
 
 def thin_score_decode(
@@ -93,8 +117,10 @@ def thin_score_decode(
     acc_cache: torch.Tensor,
     acc_block_table: torch.Tensor,
     seq_lens: torch.Tensor,
+    max_seq_len: int | None = None,
 ) -> None:
-    """Add this step's stage-1 score into acc_cache, in place. Layouts: module docstring."""
+    """Add this step's stage-1 score into acc_cache, in place. Layouts: module docstring.
+    max_seq_len (CPU int) avoids a device sync when given."""
     R, Hq, W = q_thin.shape
     _, BS_K, HW = k_cache.shape
     Hkv = HW // W
@@ -105,15 +131,31 @@ def thin_score_decode(
     assert k_block_table.stride(1) == 1 and acc_block_table.stride(1) == 1
     if R == 0:
         return
-    _thin_score_decode_kernel[(R, Hkv)](
-        q, k_cache, k_block_table, acc_cache, acc_block_table, seq_lens,
-        q.stride(0), q.stride(1),
-        k_cache.stride(0), k_cache.stride(1),
-        k_block_table.stride(0),
-        acc_cache.stride(0), acc_cache.stride(1),
-        acc_block_table.stride(0),
-        1.0 / math.sqrt(W),
-        W=W, N_REP=Hq // Hkv, BS_K=BS_K, BS_A=acc_cache.shape[1],
+    if max_seq_len is None:
+        max_seq_len = int(seq_lens.max())
+    n_blocks = (max_seq_len + BS_K - 1) // BS_K
+    sub = min(SUB_CHUNK, BS_K)
+    assert BS_K % sub == 0
+    nsub = BS_K // sub
+    n_rep = Hq // Hkv
+    scale = 1.0 / math.sqrt(W)
+    grid = (R * n_blocks * nsub, Hkv)
+    common = dict(W=W, N_REP=n_rep, BS_K=BS_K, SUB=sub, NSUB=nsub)
+
+    chunk_lse = torch.empty(R, n_blocks * nsub, Hkv, n_rep, dtype=torch.float32, device=q.device)
+    _score_lse_kernel[grid](
+        q, k_cache, k_block_table, seq_lens, chunk_lse,
+        q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_block_table.stride(0),
+        chunk_lse.stride(0), chunk_lse.stride(1), chunk_lse.stride(2),
+        scale, n_blocks, **common,
+    )
+    lse = torch.logsumexp(chunk_lse, dim=1).contiguous()                          # [R, Hkv, n_rep]
+    _score_acc_kernel[grid](
+        q, k_cache, k_block_table, seq_lens, lse, acc_cache, acc_block_table,
+        q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_block_table.stride(0),
+        lse.stride(0), lse.stride(1),
+        acc_cache.stride(0), acc_cache.stride(1), acc_block_table.stride(0),
+        scale, n_blocks, BS_A=acc_cache.shape[1], **common,
     )
 
 
