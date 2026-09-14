@@ -20,10 +20,12 @@ Warm-up/dummy batches (no known request state) run as stock FlashAttention.
 
 import torch
 
+import vllm.cascade as cascade
 from vllm.cascade import SEL_BLOCK
 from vllm.cascade.ops.score import thin_score_decode
-from vllm.cascade.ops.select import floor_start, select_blocks
-from vllm.cascade.ops.working_attn import working_attn_decode
+from vllm.cascade.ops.select import select_blocks
+from vllm.cascade.ops.working_attn import working_attn_decode, working_attn_decode_reference
+from vllm.logger import init_logger
 from vllm.cascade.runtime import CascadeRuntime, StepPlan, get_runtime
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -33,6 +35,9 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadataBuilder,
 )
+
+logger = init_logger(__name__)
+DEBUG_ATTN_CHECKS = 12
 
 
 class CascadeMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -135,6 +140,32 @@ class CascadeImpl(FlashAttentionImpl):
 
         working_attn_decode(query, kv_cache, bt, plan.a_end, rt.S, b_end, output, self.scale,
                             max_slots=rt.working_slots)
+        if cascade.debug() and l == 0 and rt.debug_attn_checks < DEBUG_ATTN_CHECKS:
+            rt.debug_attn_checks += 1
+            self._debug_check(rt, plan, query, key, value, kv_cache, bt, b_end, output)
+
+    def _debug_check(self, rt: CascadeRuntime, plan: StepPlan, query, key, value, kv_cache, bt, b_end, output):
+        """Layer 0, decode row 0: kernel vs plain-PyTorch attention over the same working slots
+        (real vLLM cache layout and strides), floor slots vs the CPU store, new token's slot vs its K/V."""
+        dev = query.device
+        ref = torch.empty_like(output[:1])
+        working_attn_decode_reference(query[:1], kv_cache, bt[:1], plan.a_end[:1], rt.S, b_end[:1], ref, self.scale)
+        attn_diff = (ref.float() - output[:1].float()).abs().max().item()
+        state = plan.states[0]
+        lf = state.lf
+        slots = torch.arange(lf, device=dev)
+        floor_gpu = kv_cache[bt[0][slots // rt.BS].long(), :, slots % rt.BS].float()
+        floor_cpu = rt.cpu_layer(0, state)[state.refresh_n - lf:state.refresh_n].to(dev).float()
+        floor_diff = (floor_gpu - floor_cpu).abs().max().item()
+        new_diff = None
+        if 0 not in plan.refresh_rows:
+            s = int(plan.a_end[0]) - 1
+            cur = kv_cache[bt[0][s // rt.BS].long(), :, s % rt.BS].float()
+            new_diff = (cur - torch.cat([key[0], value[0]], dim=-1).float()).abs().max().item()
+        logger.info("cascade debug L0 row0 n=%d refresh=%s a_end=%d lf=%d refresh_n=%d b_end=%s attn_vs_ref=%.3e "
+                    "floor_vs_cpu=%.3e new_token_slot_vs_kv=%s kv_strides=%s", plan.seq_lens[0],
+                    0 in plan.refresh_rows, int(plan.a_end[0]), lf, state.refresh_n, b_end[0].tolist(),
+                    attn_diff, floor_diff, new_diff, kv_cache.stride())
 
     def _refresh(self, rt: CascadeRuntime, plan: StepPlan, l, r, kv_cache, bt_row, acc_kv, acc_bt_row, b_end):
         n = plan.seq_lens[r]

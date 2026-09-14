@@ -97,3 +97,8 @@ def working_slots() -> int:
 
 def cpu_pool_seqs() -> int:
     return int(os.environ.get("VLLM_CASCADE_CPU_SEQS", "4"))
+
+
+def debug() -> bool:
+    """VLLM_CASCADE_DEBUG=1: log per-step plans and layer-0 consistency checks (slow)."""
+    return os.environ.get("VLLM_CASCADE_DEBUG", "0") == "1"

@@ -28,10 +28,14 @@ import torch
 
 import vllm.cascade as cascade
 from vllm.cascade.ops.select import floor_start
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
+logger = init_logger(__name__)
+
 SMALL_CAP = 64
+DEBUG_STEPS = 60
 
 
 @dataclass
@@ -88,6 +92,8 @@ class CascadeRuntime:
         self.free_slots = list(range(self.num_seqs))
         self.states: dict[int, RequestState] = {}
         self.step = 0
+        self.debug_steps = 0
+        self.debug_attn_checks = 0
 
     # ---- CPU store ----
     def pool_layer(self, layer: int) -> torch.Tensor:
@@ -159,6 +165,11 @@ class CascadeRuntime:
             qlen = qsl[r + 1] - qsl[r]
             starts_here = r >= nd and seq[r] - qlen == 0
             if qlen > 0 and not starts_here and keys[r] not in self.states:
+                if cascade.debug() and self.debug_steps < DEBUG_STEPS:
+                    self.debug_steps += 1
+                    logger.info("cascade debug step=%d FALLBACK reqs=%d decodes=%d unknown_row=%d qlen=%d seq=%s "
+                                "keys=%s known_keys=%s", self.step, num_reqs, nd, r, qlen, seq[:6], keys[:6],
+                                list(self.states)[:6])
                 return StepPlan(runtime=self, fallback=True)
 
         plan = StepPlan(runtime=self, fallback=False, num_decodes=nd, seq_lens=seq, query_start=qsl,
@@ -214,6 +225,14 @@ class CascadeRuntime:
             slots = pages * self.BS + (safe % self.BS).to(dev)
             plan.decode_slots = torch.where((idx >= 0).to(dev), slots, torch.full_like(slots, -1))
             plan.b_end = torch.stack([plan.states[r].b_end for r in range(nd)], dim=1).to(dev)
+        if cascade.debug() and self.debug_steps < DEBUG_STEPS:
+            self.debug_steps += 1
+            logger.info("cascade debug step=%d reqs=%d decodes=%d prefills=%s refresh=%s flushes=%s seq=%s "
+                        "qlens=%s keys=%s a_end=%s slot_idx=%s states=%d", self.step, num_reqs, nd,
+                        plan.prefill_rows, plan.refresh_rows,
+                        [(f.row, f.slot_start, f.count, f.cpu_start) for f in plan.flushes], seq[:6],
+                        [qsl[r + 1] - qsl[r] for r in range(min(num_reqs, 6))], keys[:6], a_end[:6],
+                        slot_idx[:6], len(self.states))
         return plan
 
 
