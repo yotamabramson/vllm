@@ -200,11 +200,20 @@ class LlamaAttention(nn.Module):
             if is_sliding:
                 sliding_window = config.sliding_window
 
-        attn_cls = (
-            EncoderOnlyAttention
-            if attn_type == AttentionType.ENCODER_ONLY
-            else Attention
-        )
+        import vllm.cascade as cascade
+
+        self.use_cascade = cascade.is_enabled() and attn_type == AttentionType.DECODER
+        if self.use_cascade:
+            from vllm.cascade.layer import CascadeAttention
+
+            assert sliding_window is None, "cascade: sliding-window layers not supported"
+            attn_cls = CascadeAttention
+        else:
+            attn_cls = (
+                EncoderOnlyAttention
+                if attn_type == AttentionType.ENCODER_ONLY
+                else Attention
+            )
 
         self.attn = attn_cls(
             self.num_heads,
@@ -225,6 +234,12 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.use_cascade:
+            q_thin, k_thin = self.attn.project_thin(q, k)
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, q_thin, k_thin)
+            output, _ = self.o_proj(attn_output)
+            return output
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
