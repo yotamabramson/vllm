@@ -2092,6 +2092,18 @@ def register_all_kvcache_specs(vllm_config):
         uniform_type_base_spec=FullAttentionSpec,
     )
 
+    import vllm.cascade as cascade
+
+    if cascade.is_full():
+        # Own uniform-type base: never packed into a block table with other specs.
+        from vllm.cascade.specs import CascadeWorkingManager, CascadeWorkingSpec
+
+        KVCacheSpecRegistry.register(
+            CascadeWorkingSpec,
+            CascadeWorkingManager,
+            uniform_type_base_spec=CascadeWorkingSpec,
+        )
+
     from vllm.platforms import current_platform
 
     current_platform.register_custom_kv_cache_specs(vllm_config)
