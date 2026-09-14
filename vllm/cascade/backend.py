@@ -145,7 +145,7 @@ class CascadeImpl(FlashAttentionImpl):
         ids, counts, fs = select_blocks(acc, n, rt.caps[l])
         acc_kv[acc_pages] = 0
 
-        pool = rt.pool_layer(l)[state.cpu_slot]                                        # [max_len, Hkv, 2D]
+        pool = rt.cpu_layer(l, state)                                                  # [capacity, Hkv, 2D]
         floor = pool[fs:n].to(dev)
         slots = torch.arange(n - fs, device=dev)
         kv_cache[bt_row[slots // rt.BS].long(), :, slots % rt.BS] = floor
