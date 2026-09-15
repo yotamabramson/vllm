@@ -141,7 +141,7 @@ class CascadeImpl(FlashAttentionImpl):
             self._refresh(rt, plan, l, r, kv_cache, bt[r], acc_kv, acc_md.block_table[r], b_end)
 
         working_attn_decode(query, kv_cache, bt, plan.a_end, rt.S, b_end, output, self.scale,
-                            max_slots=rt.working_slots)
+                            max_slots=plan.max_slots[l])
         if cascade.debug() and l == 0 and rt.debug_attn_checks < DEBUG_ATTN_CHECKS:
             rt.debug_attn_checks += 1
             self._debug_check(rt, plan, query, key, value, kv_cache, bt, b_end, output)
@@ -198,6 +198,8 @@ class CascadeImpl(FlashAttentionImpl):
         ends = (rt.S + counts * SEL_BLOCK).to(torch.int32)
         state.b_end[l] = ends
         b_end[r] = ends.to(dev)
+        if int(counts.max()) > 0:
+            plan.max_slots[l] = max(plan.max_slots[l], int(ends.max()))
 
 
 class CascadeBackend(FlashAttentionBackend):

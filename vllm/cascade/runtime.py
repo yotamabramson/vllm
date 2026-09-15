@@ -71,6 +71,7 @@ class StepPlan:
     a_end: torch.Tensor | None = None          # [nd] int32
     decode_slots: torch.Tensor | None = None   # [nd] int64, -1 = refresh row (no working write)
     b_end: torch.Tensor | None = None          # [L, nd, Hkv] int32
+    max_slots: list[int] = field(default_factory=list)   # per layer: highest working slot any row attends
     max_decode_seq_len: int = 0
 
 
@@ -227,7 +228,14 @@ class CascadeRuntime:
             pages = m.block_table_tensor[rows.to(dev), (safe // self.BS).to(dev)].to(torch.int64)
             slots = pages * self.BS + (safe % self.BS).to(dev)
             plan.decode_slots = torch.where((idx >= 0).to(dev), slots, torch.full_like(slots, -1))
-            plan.b_end = torch.stack([plan.states[r].b_end for r in range(nd)], dim=1).to(dev)
+            b_end_cpu = torch.stack([plan.states[r].b_end for r in range(nd)], dim=1)      # [L, nd, Hkv]
+            plan.b_end = b_end_cpu.to(dev)
+            # Sizes the attention kernel's per-chunk buffers to this batch, not to the
+            # worst-case budget (1024 warm-up requests x full budget ran out of memory).
+            # b_end == S means "nothing selected" and adds no slots.
+            max_a = max(a_end)
+            selected_end = torch.where(b_end_cpu > self.S, b_end_cpu, 0).amax(dim=(1, 2)).tolist()
+            plan.max_slots = [max(max_a, int(v)) for v in selected_end]
         if cascade.debug() and self.debug_steps < DEBUG_STEPS:
             self.debug_steps += 1
             logger.info("cascade debug step=%d reqs=%d decodes=%d prefills=%s refresh=%s flushes=%s seq=%s "
