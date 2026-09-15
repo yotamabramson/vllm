@@ -18,10 +18,13 @@ runtime.py):
 Warm-up/dummy batches (no known request state) run as stock FlashAttention.
 """
 
+import math
+
 import torch
 
 import vllm.cascade as cascade
 from vllm.cascade import SEL_BLOCK
+from vllm.cascade import THIN_WIDTH as THIN
 from vllm.cascade.ops.score import thin_score_decode
 from vllm.cascade.ops.select import select_blocks
 from vllm.cascade.ops.working_attn import working_attn_decode, working_attn_decode_reference
@@ -138,7 +141,8 @@ class CascadeImpl(FlashAttentionImpl):
 
         b_end = plan.b_end[l]
         for r in plan.refresh_rows:
-            self._refresh(rt, plan, l, r, kv_cache, bt[r], acc_kv, acc_md.block_table[r], b_end)
+            self._refresh(rt, plan, l, r, kv_cache, bt[r], acc_kv, acc_md.block_table[r], b_end,
+                          q_thin[r], thin_kv, thin_md.block_table[r])
 
         working_attn_decode(query, kv_cache, bt, plan.a_end, rt.S, b_end, output, self.scale,
                             max_slots=plan.max_slots[l])
@@ -169,13 +173,16 @@ class CascadeImpl(FlashAttentionImpl):
                     0 in plan.refresh_rows, int(plan.a_end[0]), lf, state.refresh_n, b_end[0].tolist(),
                     attn_diff, floor_diff, new_diff, kv_cache.stride())
 
-    def _refresh(self, rt: CascadeRuntime, plan: StepPlan, l, r, kv_cache, bt_row, acc_kv, acc_bt_row, b_end):
+    def _refresh(self, rt: CascadeRuntime, plan: StepPlan, l, r, kv_cache, bt_row, acc_kv, acc_bt_row, b_end,
+                 q_thin_row, thin_kv, thin_bt_row):
         n = plan.seq_lens[r]
         state = plan.states[r]
         dev = kv_cache.device
         acc_pages = acc_bt_row[: (n + acc_kv.shape[1] - 1) // acc_kv.shape[1]].long()
         acc = acc_kv[acc_pages].reshape(-1, rt.Hkv)[:n]
         ids, counts, fs = select_blocks(acc, n, rt.caps[l])
+        if cascade.debug() and r == 0 and l in (0, 15, 31) and state.prompt_len == n - 1:
+            self._debug_select(rt, l, n, acc, ids, counts, q_thin_row, thin_kv, thin_bt_row)
         acc_kv[acc_pages] = 0
 
         pool = rt.cpu_layer(l, state)                                                  # [capacity, Hkv, 2D]
@@ -201,6 +208,25 @@ class CascadeImpl(FlashAttentionImpl):
         if int(counts.max()) > 0:
             plan.max_slots[l] = max(plan.max_slots[l], int(ends.max()))
 
+
+    def _debug_select(self, rt: CascadeRuntime, l, n, acc, ids, counts, q_thin_row, thin_kv, thin_bt_row):
+        """First refresh after prefill (window = this step only): the accumulated score must equal the
+        harness formula recomputed from the thin-K cache, and the selected blocks must match."""
+        bs_t = thin_kv.shape[1]
+        pages = thin_bt_row[: (n + bs_t - 1) // bs_t].long()
+        k = thin_kv[pages].reshape(-1, rt.Hkv, THIN)[:n].float()                          # [n, Hkv, 32]
+        q = q_thin_row.float().view(rt.Hkv, -1, THIN)
+        w = torch.softmax(torch.einsum("hrd,nhd->hrn", q, k) / math.sqrt(THIN), dim=-1).max(dim=1).values.T
+        rel = ((acc - w).abs() / w.abs().clamp_min(1e-12)).max().item()
+        ref_ids, ref_counts, _ = select_blocks(w, n, rt.caps[l])
+        overlap = []
+        for h in range(rt.Hkv):
+            got = set(ids[h][ids[h] >= 0].tolist())
+            ref = set(ref_ids[h][ref_ids[h] >= 0].tolist())
+            overlap.append(round(len(got & ref) / max(1, len(ref)), 3))
+        logger.info("cascade debug select L%d n=%d acc_vs_formula_max_rel=%.3e counts=%s ref_counts=%s "
+                    "overlap_per_head=%s acc_sum_per_head=%s", l, n, rel, counts.tolist(), ref_counts.tolist(),
+                    overlap, [round(v, 3) for v in acc.sum(0).tolist()])
 
 class CascadeBackend(FlashAttentionBackend):
     # The layer's op writes K/V itself: decode tokens go to working slots, not the
