@@ -81,9 +81,11 @@ class CascadeImpl(FlashAttentionImpl):
 
         # Thin-K for every scheduled token, positional. Its accumulator entry starts at
         # zero: side-cache blocks are recycled from finished requests.
+        # Padding slots are -1 (vLLM's cache-write kernel skips them); send them to the
+        # null block's first slot, which nothing reads.
         thin_kv.view(-1, thin_kv.shape[-1]).index_copy_(
-            0, thin_md.slot_mapping[:T], k_thin[:T].reshape(T, -1).to(thin_kv.dtype))
-        acc_kv.view(-1, acc_kv.shape[-1]).index_fill_(0, acc_md.slot_mapping[:T], 0.0)
+            0, thin_md.slot_mapping[:T].clamp(min=0), k_thin[:T].reshape(T, -1).to(thin_kv.dtype))
+        acc_kv.view(-1, acc_kv.shape[-1]).index_fill_(0, acc_md.slot_mapping[:T].clamp(min=0), 0.0)
 
         nd = plan.num_decodes
         if T > nd:

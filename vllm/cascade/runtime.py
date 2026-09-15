@@ -93,6 +93,7 @@ class CascadeRuntime:
         self.states: dict[int, RequestState] = {}
         self.step = 0
         self.debug_steps = 0
+        self.debug_fallbacks = 0
         self.debug_attn_checks = 0
 
     # ---- CPU store ----
@@ -159,15 +160,17 @@ class CascadeRuntime:
         nd, _, num_decode_tokens, _ = split_decodes_and_prefills(m, decode_threshold=1)
         assert num_decode_tokens == nd
 
-        # A decode row we never saw prefill, or a continued prefill chunk we never saw
-        # start, has no state to work with: run the batch as stock attention.
+        # Stock attention for batches we cannot track: vLLM's warm-up, autotune and
+        # graph-capture batches use block 0 -- the reserved null block, never given to a
+        # real request -- and a decode row we never saw prefill, or a continued prefill
+        # chunk we never saw start, has no state to work with.
         for r in range(num_reqs):
             qlen = qsl[r + 1] - qsl[r]
             starts_here = r >= nd and seq[r] - qlen == 0
-            if qlen > 0 and not starts_here and keys[r] not in self.states:
-                if cascade.debug() and self.debug_steps < DEBUG_STEPS:
-                    self.debug_steps += 1
-                    logger.info("cascade debug step=%d FALLBACK reqs=%d decodes=%d unknown_row=%d qlen=%d seq=%s "
+            if keys[r] == 0 or (qlen > 0 and not starts_here and keys[r] not in self.states):
+                if cascade.debug() and self.debug_fallbacks < 3:
+                    self.debug_fallbacks += 1
+                    logger.info("cascade debug step=%d FALLBACK reqs=%d decodes=%d row=%d qlen=%d seq=%s "
                                 "keys=%s known_keys=%s", self.step, num_reqs, nd, r, qlen, seq[:6], keys[:6],
                                 list(self.states)[:6])
                 return StepPlan(runtime=self, fallback=True)
