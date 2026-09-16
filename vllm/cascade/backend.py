@@ -19,6 +19,7 @@ Warm-up/dummy batches (no known request state) run as stock FlashAttention.
 """
 
 import math
+import time
 
 import torch
 
@@ -185,17 +186,24 @@ class CascadeImpl(FlashAttentionImpl):
             self._debug_select(rt, l, n, acc, ids, counts, q_thin_row, thin_kv, thin_bt_row)
         acc_kv[acc_pages] = 0
 
+        t_start = time.perf_counter()
         pool = rt.cpu_layer(l, state)                                                  # [capacity, Hkv, 2D]
         floor = pool[fs:n].to(dev)
         slots = torch.arange(n - fs, device=dev)
         kv_cache[bt_row[slots // rt.BS].long(), :, slots % rt.BS] = floor
 
         k_max = ids.shape[1]
+        t_gather = t_h2d = 0.0
         if k_max:
             tok = (ids.clamp(min=0)[:, :, None] * SEL_BLOCK
                    + torch.arange(SEL_BLOCK, device=dev)).reshape(rt.Hkv, -1).cpu()      # [Hkv, M]
             heads = torch.arange(rt.Hkv)[:, None].expand_as(tok)
-            selected = pool[tok, heads].to(dev)                                         # [Hkv, M, 2D]
+            t0 = time.perf_counter()
+            gathered = pool[tok, heads]                                                  # CPU gather
+            t1 = time.perf_counter()
+            selected = gathered.to(dev)                                                  # host -> GPU
+            t2 = time.perf_counter()
+            t_gather, t_h2d = t1 - t0, t2 - t1
             j = torch.arange(tok.shape[1], device=dev)
             valid = j[None, :] < (counts.to(dev) * SEL_BLOCK)[:, None]
             h_idx, j_idx = valid.nonzero(as_tuple=True)
@@ -207,6 +215,28 @@ class CascadeImpl(FlashAttentionImpl):
         b_end[r] = ends.to(dev)
         if int(counts.max()) > 0:
             plan.max_slots[l] = max(plan.max_slots[l], int(ends.max()))
+        if cascade.debug() and r == 0 and l in (0, 15, 31):
+            self._debug_refresh(rt, state, l, n, ids, counts, time.perf_counter() - t_start, t_gather, t_h2d)
+
+    def _debug_refresh(self, rt: CascadeRuntime, state, l, n, ids, counts, total_s, gather_s, h2d_s):
+        """Per refresh: how much of the new selection was already selected last time (delta size),
+        and where the refresh time goes (CPU gather vs host->GPU transfer)."""
+        ids_cpu = ids.cpu()
+        prev = state.prev_ids.get(l)
+        overlap = None
+        if prev is not None:
+            kept = total = 0
+            for h in range(rt.Hkv):
+                new_h = set(ids_cpu[h][ids_cpu[h] >= 0].tolist())
+                old_h = set(prev[h][prev[h] >= 0].tolist())
+                kept += len(new_h & old_h)
+                total += len(new_h)
+            overlap = round(kept / max(1, total), 4)
+        state.prev_ids[l] = ids_cpu
+        mb = int(counts.sum()) * SEL_BLOCK * rt.D * 2 * 2 / 2**20
+        logger.info("cascade refresh L%d n=%d blocks=%d fetched=%.1fMB total=%.0fms gather=%.0fms h2d=%.0fms "
+                    "(%.2f GB/s) overlap_with_previous=%s", l, n, int(counts.sum()), mb, total_s * 1e3,
+                    gather_s * 1e3, h2d_s * 1e3, mb / 2**10 / max(h2d_s, 1e-9), overlap)
 
 
     def _debug_select(self, rt: CascadeRuntime, l, n, acc, ids, counts, q_thin_row, thin_kv, thin_bt_row):

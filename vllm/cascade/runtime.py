@@ -47,6 +47,7 @@ class RequestState:
     refresh_n: int = 0           # seq_len at the last refresh (0 = none yet)
     lf: int = 0                  # floor length at the last refresh
     last_seen: int = 0
+    prev_ids: dict = field(default_factory=dict)   # debug only: layer -> last refresh's block ids
 
 
 @dataclass
