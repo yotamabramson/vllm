@@ -162,7 +162,7 @@ class CascadeImpl(FlashAttentionImpl):
         lf = state.lf
         slots = torch.arange(lf, device=dev)
         floor_gpu = kv_cache[bt[0][slots // rt.BS].long(), :, slots % rt.BS].float()
-        floor_cpu = rt.cpu_layer(0, state)[state.refresh_n - lf:state.refresh_n].to(dev).float()
+        floor_cpu = rt.cpu_layer(0, state)[:, state.refresh_n - lf:state.refresh_n].to(dev).transpose(0, 1).float()
         floor_diff = (floor_gpu - floor_cpu).abs().max().item()
         new_diff = None
         if 0 not in plan.refresh_rows:
@@ -187,28 +187,68 @@ class CascadeImpl(FlashAttentionImpl):
         acc_kv[acc_pages] = 0
 
         t_start = time.perf_counter()
-        pool = rt.cpu_layer(l, state)                                                  # [capacity, Hkv, 2D]
-        floor = pool[fs:n].to(dev)
-        slots = torch.arange(n - fs, device=dev)
-        kv_cache[bt_row[slots // rt.BS].long(), :, slots % rt.BS] = floor
+        pool = rt.cpu_layer(l, state)                                                  # [Hkv, capacity, 2D]
+        lf = n - fs
+        if state.refresh_n == 0:
+            # First refresh: the working pages still hold the prompt positionally, so the
+            # floor has to come from the CPU store.
+            floor = pool[:, fs:n].to(dev).transpose(0, 1).contiguous()                 # [lf, Hkv, 2D]
+            slots = torch.arange(lf, device=dev)
+            kv_cache[bt_row[slots // rt.BS].long(), :, slots % rt.BS] = floor
+        else:
+            # Floor and the tokens decoded since the last refresh are already on the GPU,
+            # contiguous from slot (token - previous floor start): shift instead of re-fetching.
+            shift = fs - (state.refresh_n - state.lf)
+            if shift > 0:
+                src = torch.arange(shift, shift + lf, device=dev)
+                moved = kv_cache[bt_row[src // rt.BS].long(), :, src % rt.BS]
+                dst = torch.arange(lf, device=dev)
+                kv_cache[bt_row[dst // rt.BS].long(), :, dst % rt.BS] = moved
+        t_floor = time.perf_counter()
 
-        k_max = ids.shape[1]
-        t_gather = t_h2d = 0.0
-        if k_max:
-            tok = (ids.clamp(min=0)[:, :, None] * SEL_BLOCK
-                   + torch.arange(SEL_BLOCK, device=dev)).reshape(rt.Hkv, -1).cpu()      # [Hkv, M]
-            heads = torch.arange(rt.Hkv)[:, None].expand_as(tok)
-            t0 = time.perf_counter()
-            gathered = pool[tok, heads]                                                  # CPU gather
-            t1 = time.perf_counter()
-            selected = gathered.to(dev)                                                  # host -> GPU
-            t2 = time.perf_counter()
-            t_gather, t_h2d = t1 - t0, t2 - t1
-            j = torch.arange(tok.shape[1], device=dev)
-            valid = j[None, :] < (counts.to(dev) * SEL_BLOCK)[:, None]
-            h_idx, j_idx = valid.nonzero(as_tuple=True)
-            dst = rt.S + j_idx
-            kv_cache[bt_row[dst // rt.BS].long(), h_idx, dst % rt.BS] = selected[h_idx, j_idx]
+        # Selected blocks: fetch only blocks that are not resident already, into the slots
+        # whose blocks were dropped (measured overlap between refreshes: 85-99%).
+        ids_cpu = ids.cpu()
+        k_max = ids_cpu.shape[1]
+        resident = state.resident.get(l)
+        if resident is None or resident.shape[1] < k_max:
+            grown = torch.full((rt.Hkv, k_max), -1, dtype=torch.int64)
+            if resident is not None:
+                grown[:, : resident.shape[1]] = resident
+            resident = grown
+        need_per_head, free_per_head = [], []
+        for h in range(rt.Hkv):
+            cnt = int(counts[h])
+            new_h = ids_cpu[h, :cnt]
+            old_h = resident[h]
+            need = new_h[~torch.isin(new_h, old_h)] if cnt else new_h[:0]
+            free = (~torch.isin(old_h, new_h)).nonzero(as_tuple=True)[0]
+            free = free[free < cnt][: need.numel()]
+            need = need[: free.numel()]
+            old_h[free] = need
+            need_per_head.append(need)
+            free_per_head.append(free)
+        state.resident[l] = resident
+        fetched = int(sum(x.numel() for x in need_per_head))
+
+        row_elems = SEL_BLOCK * 2 * rt.D
+        t_gather = t_h2d = t_floor
+        if fetched:
+            blocks = pool.view(rt.Hkv, -1, row_elems)                                   # [Hkv, blocks, 8KB row]
+            staging = rt.staging(fetched, row_elems)
+            at = 0
+            for h, need in enumerate(need_per_head):
+                if need.numel():
+                    torch.index_select(blocks[h], 0, need, out=staging[at:at + need.numel()])
+                    at += need.numel()
+            t_gather = time.perf_counter()
+            data = staging.to(dev, non_blocking=False).view(-1, SEL_BLOCK, 2 * rt.D)
+            t_h2d = time.perf_counter()
+            slot0 = rt.S + torch.cat(free_per_head).to(dev) * SEL_BLOCK
+            slots = (slot0[:, None] + torch.arange(SEL_BLOCK, device=dev)[None, :]).reshape(-1)
+            head_idx = torch.cat([torch.full((f.numel(),), h, dtype=torch.int64)
+                                  for h, f in enumerate(free_per_head)]).to(dev).repeat_interleave(SEL_BLOCK)
+            kv_cache[bt_row[slots // rt.BS].long(), head_idx, slots % rt.BS] = data.reshape(-1, 2 * rt.D)
 
         ends = (rt.S + counts * SEL_BLOCK).to(torch.int32)
         state.b_end[l] = ends
@@ -216,11 +256,13 @@ class CascadeImpl(FlashAttentionImpl):
         if int(counts.max()) > 0:
             plan.max_slots[l] = max(plan.max_slots[l], int(ends.max()))
         if cascade.debug() and r == 0 and l in (0, 15, 31):
-            self._debug_refresh(rt, state, l, n, ids, counts, time.perf_counter() - t_start, t_gather, t_h2d)
+            self._debug_refresh(rt, state, l, n, ids, counts, fetched, time.perf_counter() - t_start,
+                                t_floor - t_start, t_gather - t_floor, t_h2d - t_gather)
 
-    def _debug_refresh(self, rt: CascadeRuntime, state, l, n, ids, counts, total_s, gather_s, h2d_s):
+    def _debug_refresh(self, rt: CascadeRuntime, state, l, n, ids, counts, fetched, total_s, floor_s, gather_s,
+                       h2d_s):
         """Per refresh: how much of the new selection was already selected last time (delta size),
-        and where the refresh time goes (CPU gather vs host->GPU transfer)."""
+        and where the refresh time goes (floor, CPU gather, host->GPU transfer)."""
         ids_cpu = ids.cpu()
         prev = state.prev_ids.get(l)
         overlap = None
@@ -233,10 +275,12 @@ class CascadeImpl(FlashAttentionImpl):
                 total += len(new_h)
             overlap = round(kept / max(1, total), 4)
         state.prev_ids[l] = ids_cpu
-        mb = int(counts.sum()) * SEL_BLOCK * rt.D * 2 * 2 / 2**20
-        logger.info("cascade refresh L%d n=%d blocks=%d fetched=%.1fMB total=%.0fms gather=%.0fms h2d=%.0fms "
-                    "(%.2f GB/s) overlap_with_previous=%s", l, n, int(counts.sum()), mb, total_s * 1e3,
-                    gather_s * 1e3, h2d_s * 1e3, mb / 2**10 / max(h2d_s, 1e-9), overlap)
+        selected = int(counts.sum())
+        mb = fetched * SEL_BLOCK * rt.D * 2 * 2 / 2**20
+        logger.info("cascade refresh L%d n=%d selected_blocks=%d fetched_blocks=%d (%.1fMB) total=%.0fms "
+                    "floor=%.0fms gather=%.0fms h2d=%.0fms (%.2f GB/s) overlap_with_previous=%s",
+                    l, n, selected, fetched, mb, total_s * 1e3, floor_s * 1e3, gather_s * 1e3, h2d_s * 1e3,
+                    mb / 2**10 / max(h2d_s, 1e-9), overlap)
 
 
     def _debug_select(self, rt: CascadeRuntime, l, n, acc, ids, counts, q_thin_row, thin_kv, thin_bt_row):

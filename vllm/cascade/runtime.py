@@ -47,6 +47,7 @@ class RequestState:
     refresh_n: int = 0           # seq_len at the last refresh (0 = none yet)
     lf: int = 0                  # floor length at the last refresh
     last_seen: int = 0
+    resident: dict = field(default_factory=dict)   # layer -> [Hkv, K] int64: block id in each selected slot
     prev_ids: dict = field(default_factory=dict)   # debug only: layer -> last refresh's block ids
 
 
@@ -94,24 +95,37 @@ class CascadeRuntime:
         self.free_slots = list(range(self.num_seqs))
         self.states: dict[int, RequestState] = {}
         self.step = 0
+        self._staging: torch.Tensor | None = None
         self.debug_steps = 0
         self.debug_fallbacks = 0
         self.debug_attn_checks = 0
 
+    def staging(self, rows: int, row_elems: int) -> torch.Tensor:
+        """Pinned staging buffer for the refresh fetch, so the host->GPU copy is a DMA
+        from pinned memory rather than from a freshly allocated pageable tensor."""
+        buf = self._staging
+        if buf is None or buf.shape[0] < rows or buf.shape[1] != row_elems:
+            buf = torch.empty(max(rows, 1024), row_elems, dtype=self.dtype, pin_memory=True)
+            self._staging = buf
+        return buf[:rows]
+
     # ---- CPU store ----
+    # Head-major ([Hkv, tokens, 2D]) so one head's 16-token block is a single
+    # contiguous 8 KB row: the refresh gather becomes bulk row copies instead of
+    # scattered element indexing (measured 40-45 ms per layer, 90% of refresh cost).
     def pool_layer(self, layer: int) -> torch.Tensor:
-        """[num_seqs, max_len, Hkv, 2D] pinned, allocated on first use."""
+        """[num_seqs, Hkv, max_len, 2D] pinned, allocated on first use."""
         if self.pool[layer] is None:
-            self.pool[layer] = torch.empty(self.num_seqs, self.max_len, self.Hkv, 2 * self.D,
+            self.pool[layer] = torch.empty(self.num_seqs, self.Hkv, self.max_len, 2 * self.D,
                                            dtype=self.dtype, pin_memory=True)
         return self.pool[layer]
 
     def cpu_layer(self, layer: int, state: RequestState) -> torch.Tensor:
-        """This request's CPU store for one layer: [capacity, Hkv, 2D]."""
+        """This request's CPU store for one layer: [Hkv, capacity, 2D]."""
         if state.cpu_slot is not None:
             return self.pool_layer(layer)[state.cpu_slot]
         if state.small[layer] is None:
-            state.small[layer] = torch.empty(SMALL_CAP, self.Hkv, 2 * self.D, dtype=self.dtype)
+            state.small[layer] = torch.empty(self.Hkv, SMALL_CAP, 2 * self.D, dtype=self.dtype)
         return state.small[layer]
 
     def ensure_capacity(self, state: RequestState, end: int) -> None:
@@ -126,13 +140,14 @@ class CascadeRuntime:
         slot = self.free_slots.pop()
         for layer, small in enumerate(state.small):
             if small is not None:
-                self.pool_layer(layer)[slot, :SMALL_CAP].copy_(small)
+                self.pool_layer(layer)[slot, :, :SMALL_CAP].copy_(small)
         state.small = [None] * self.L
         state.cpu_slot = slot
 
     def write_cpu(self, layer: int, state: RequestState, start: int, kv: torch.Tensor, blocking: bool) -> None:
         """kv: [m, Hkv, 2D] (GPU) -> CPU store positions [start, start + m)."""
-        self.cpu_layer(layer, state)[start:start + kv.shape[0]].copy_(kv, non_blocking=not blocking)
+        head_major = kv.transpose(0, 1).contiguous()                                  # [Hkv, m, 2D]
+        self.cpu_layer(layer, state)[:, start:start + kv.shape[0]].copy_(head_major, non_blocking=not blocking)
 
     # ---- request states ----
     def _release(self, state: RequestState) -> None:
