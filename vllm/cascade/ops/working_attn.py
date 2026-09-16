@@ -37,7 +37,7 @@ import torch
 import triton
 import triton.language as tl
 
-SUB_CHUNK = 64
+SUB_CHUNK = 128
 
 
 @triton.jit
@@ -69,22 +69,25 @@ def _working_attn_chunk_kernel(
     valid = (slot < a_end) | ((slot >= b_start) & (slot < b_end))
 
     page = tl.load(BT + r * stride_bt_r + pg).to(tl.int64)
-    q = tl.load(Q + r * stride_q_r + q_heads[:, None] * stride_q_h + dims[None, :] * stride_q_d).to(tl.float32)
+    # Q/K/V stay in the cache dtype for the dots (tensor cores accumulate in fp32, as the
+    # harness's own fp16 matmuls do); converting them to fp32 first doubled shared memory
+    # and capped chunks at 64 slots.
+    q = tl.load(Q + r * stride_q_r + q_heads[:, None] * stride_q_h + dims[None, :] * stride_q_d)
     base = KV + page * stride_kv_b + h * stride_kv_h
     # K as [D, SUB] and V as [SUB, D] so both products are tl.dot (fused matmul).
     k = tl.load(base + offs[None, :] * stride_kv_t + dims[:, None] * stride_kv_d,
-                mask=valid[None, :], other=0.0).to(tl.float32)                        # [D, SUB]
+                mask=valid[None, :], other=0.0)                                       # [D, SUB]
     v = tl.load(base + offs[:, None] * stride_kv_t + (D + dims[None, :]) * stride_kv_d,
-                mask=valid[:, None], other=0.0).to(tl.float32)                        # [SUB, D]
+                mask=valid[:, None], other=0.0)                                       # [SUB, D]
 
-    s = tl.dot(q, k, input_precision="ieee") * scale                                  # [N_REP, SUB]
+    s = tl.dot(q, k) * scale                                                          # [N_REP, SUB] fp32
     s = tl.where(valid[None, :], s, float("-inf"))
     m = tl.max(s, axis=1)
     safe_m = tl.where(m > float("-inf"), m, 0.0)
     p = tl.where(valid[None, :], tl.exp(s - safe_m[:, None]), 0.0)
     wsum = tl.sum(p, axis=1)
     lse = tl.where(wsum > 0, safe_m + tl.log(wsum), float("-inf"))
-    avg = tl.dot(p, v, input_precision="ieee") / tl.maximum(wsum, 1e-30)[:, None]      # [N_REP, D]
+    avg = tl.dot(p.to(v.dtype), v) / tl.maximum(wsum, 1e-30)[:, None]                 # [N_REP, D]
 
     chunk = pg * NSUB + c
     tl.store(LSE + r * stride_l_r + chunk * stride_l_c + q_heads * stride_l_h, lse)

@@ -38,7 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
-SUB_CHUNK = 128
+SUB_CHUNK = 512
 
 
 @triton.jit
@@ -57,10 +57,12 @@ def _chunk_scores(Q, K_CACHE, K_BT, SEQ_LENS, pid0, h,
     pos = b * BS_K + offs
     tok = pos < n
     phys = tl.load(K_BT + r * stride_kbt_r + b).to(tl.int64)
-    q = tl.load(Q + r * stride_q_r + (h * N_REP + reps)[:, None] * stride_q_h + dims[None, :]).to(tl.float32)
+    # Q/K stay in the cache dtype for the dot (fp32 accumulation), like the harness's own
+    # fp16 einsum; converting to fp32 first only inflated shared memory.
+    q = tl.load(Q + r * stride_q_r + (h * N_REP + reps)[:, None] * stride_q_h + dims[None, :])
     k = tl.load(K_CACHE + phys * stride_k_b + offs[None, :] * stride_k_t + (h * W + dims)[:, None],
-                mask=tok[None, :], other=0.0).to(tl.float32)                       # [W, SUB]
-    s = tl.dot(q, k, input_precision="ieee") * scale                              # [N_REP, SUB]
+                mask=tok[None, :], other=0.0)                                     # [W, SUB]
+    s = tl.dot(q, k) * scale                                                      # [N_REP, SUB] fp32
     return r, b, c, pos, tok, s
 
 
