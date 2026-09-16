@@ -189,7 +189,7 @@ class CascadeImpl(FlashAttentionImpl):
         t_start = time.perf_counter()
         pool = rt.cpu_layer(l, state)                                                  # [Hkv, capacity, 2D]
         lf = n - fs
-        if state.refresh_n == 0:
+        if state.prev_refresh_n == 0:
             # First refresh: the working pages still hold the prompt positionally, so the
             # floor has to come from the CPU store.
             floor = pool[:, fs:n].to(dev).transpose(0, 1).contiguous()                 # [lf, Hkv, 2D]
@@ -198,7 +198,7 @@ class CascadeImpl(FlashAttentionImpl):
         else:
             # Floor and the tokens decoded since the last refresh are already on the GPU,
             # contiguous from slot (token - previous floor start): shift instead of re-fetching.
-            shift = fs - (state.refresh_n - state.lf)
+            shift = fs - (state.prev_refresh_n - state.prev_lf)
             if shift > 0:
                 src = torch.arange(shift, shift + lf, device=dev)
                 moved = kv_cache[bt_row[src // rt.BS].long(), :, src % rt.BS]

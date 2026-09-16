@@ -46,6 +46,11 @@ class RequestState:
     prompt_len: int | None = None
     refresh_n: int = 0           # seq_len at the last refresh (0 = none yet)
     lf: int = 0                  # floor length at the last refresh
+    # The values refresh_n/lf had before this step's refresh. The plan advances them
+    # before the forward pass runs, but the refresh itself needs the old window to know
+    # where the floor currently sits on the GPU.
+    prev_refresh_n: int = 0
+    prev_lf: int = 0
     last_seen: int = 0
     resident: dict = field(default_factory=dict)   # layer -> [Hkv, K] int64: block id in each selected slot
     prev_ids: dict = field(default_factory=dict)   # debug only: layer -> last refresh's block ids
@@ -222,11 +227,17 @@ class CascadeRuntime:
                     count = n - 1 - state.refresh_n
                     if count > 0:
                         plan.flushes.append(Flush(r, state.lf, count, state.refresh_n))
+                state.prev_refresh_n, state.prev_lf = state.refresh_n, state.lf
                 state.lf = n - floor_start(n)
                 state.refresh_n = n
                 plan.refresh_rows.append(r)
                 a_end.append(state.lf)
-                slot_idx.append(-1)
+                # This step's token still needs a working slot: it goes to where the old
+                # window would have put it, and the refresh's floor shift then moves it into
+                # place. At the first refresh there is no old window and the floor comes from
+                # the CPU store, which already has this token.
+                slot_idx.append(-1 if state.prev_refresh_n == 0
+                                else state.prev_lf + (n - 1 - state.prev_refresh_n))
             else:
                 end = state.lf + (n - state.refresh_n)
                 assert end <= self.S, f"cascade: {end} slots since refresh exceed floor+p={self.S}"
