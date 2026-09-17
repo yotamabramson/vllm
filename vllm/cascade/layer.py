@@ -76,14 +76,17 @@ class CascadeAttention(Attention):
             return super().get_kv_cache_spec(vllm_config)
         from vllm.cascade.specs import CascadeWorkingSpec
 
+        # One page per KV group (see specs.py): each (request, group) is its own
+        # FlashAttention row at decode.
         return CascadeWorkingSpec(
             block_size=vllm_config.cache_config.block_size,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=1,
             head_size=self.head_size,
             head_size_v=self.head_size_v,
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             working_slots=cascade.working_slots(),
+            num_groups=self.num_kv_heads,
         )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):

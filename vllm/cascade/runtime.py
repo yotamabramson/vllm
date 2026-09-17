@@ -13,11 +13,16 @@ unpinned) and moves to a full-length pinned slot as soon as it needs more.
 vLLM's warm-up runs hundreds of 2-token dummy requests through the real path;
 real long prompts cross SMALL_CAP in their first prefill chunk.
 
-Working-page slot layout per request (same for every layer; contents per head):
-    [0, lf)                  recency floor at the last refresh (lf = 1000..1015)
-    [lf, lf + t)             tokens decoded since that refresh: token at position j
-                             sits at slot lf + (j - refresh_n)
-    [S, S + 16 * count_h)    head h's selected blocks, S = FLOOR_SLOTS + p
+Working-slot layout, per (request, layer, KV group) -- one contiguous range so
+FlashAttention can serve it with a length and no mask:
+
+    [0, sel)             the group's selected 16-token blocks (sel = 16 * blocks)
+    [sel, sel + lf)      recency floor as of the last refresh (lf = 1000..1015)
+    [sel + lf, ...)      tokens decoded since that refresh
+
+Pages hold one KV group and interleave by group (flat block = position * Hkv + g,
+see specs.py), so a group's block table is bt[:, g::Hkv].
+
 Refresh cadence (harness step_count): decode step t = n - prompt_len - 1 refreshes
 when t % p == 0, so the first decode step after prefill refreshes.
 """
@@ -27,6 +32,7 @@ from dataclasses import dataclass, field
 import torch
 
 import vllm.cascade as cascade
+from vllm.cascade.ops.layout import decode_lengths_and_slots, group_block_table
 from vllm.cascade.ops.select import floor_start
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -40,26 +46,23 @@ DEBUG_STEPS = 60
 
 @dataclass
 class RequestState:
-    b_end: torch.Tensor          # [L, Hkv] int32 CPU: end slot of each head's selection, per layer
+    sel_len: torch.Tensor        # [L, Hkv] int32 CPU: selected tokens per layer and group
     cpu_slot: int | None = None  # pinned slot, once the request outgrows SMALL_CAP
     small: list[torch.Tensor | None] = field(default_factory=list)   # per layer, until then
     prompt_len: int | None = None
     refresh_n: int = 0           # seq_len at the last refresh (0 = none yet)
     lf: int = 0                  # floor length at the last refresh
-    # The values refresh_n/lf had before this step's refresh. The plan advances them
-    # before the forward pass runs, but the refresh itself needs the old window to know
-    # where the floor currently sits on the GPU.
-    prev_refresh_n: int = 0
-    prev_lf: int = 0
+    prev_refresh_n: int = 0      # the same two, as they were before this step's refresh:
+    prev_lf: int = 0             # the plan advances them before the forward pass runs
     last_seen: int = 0
-    resident: dict = field(default_factory=dict)   # layer -> [Hkv, K] int64: block id in each selected slot
+    resident: dict = field(default_factory=dict)   # layer -> [Hkv, K] int64: block id in each slot
     prev_ids: dict = field(default_factory=dict)   # debug only: layer -> last refresh's block ids
 
 
 @dataclass
 class Flush:
     row: int
-    slot_start: int              # working slot of the first token to flush
+    slot_start: int              # working slot of the first token to flush (group 0's frame)
     count: int
     cpu_start: int               # its position in the sequence
 
@@ -75,10 +78,10 @@ class StepPlan:
     prefill_rows: list[int] = field(default_factory=list)
     refresh_rows: list[int] = field(default_factory=list)
     flushes: list[Flush] = field(default_factory=list)
-    a_end: torch.Tensor | None = None          # [nd] int32
-    decode_slots: torch.Tensor | None = None   # [nd] int64, -1 = refresh row (no working write)
-    b_end: torch.Tensor | None = None          # [L, nd, Hkv] int32
-    max_slots: list[int] = field(default_factory=list)   # per layer: highest working slot any row attends
+    # decode tensors; rows are group-major: row = g * num_decodes + r
+    bt_rows: torch.Tensor | None = None      # [nd * Hkv, blocks per group] int32
+    lens: torch.Tensor | None = None         # [L, nd * Hkv] int32: KV length of each row
+    write_slots: torch.Tensor | None = None  # [L, nd * Hkv] int32: this token's slot (-1 = skip)
     max_decode_seq_len: int = 0
 
 
@@ -89,7 +92,6 @@ class CascadeRuntime:
         self.dtype = dtype
         self.max_len = max_len
         self.p = cascade.refresh_period()
-        self.S = cascade.working_start()
         self.working_slots = cascade.working_slots()
         caps = cascade.capacities()
         assert len(caps) == num_layers and all(len(row) == num_kv_heads for row in caps), (
@@ -103,7 +105,15 @@ class CascadeRuntime:
         self._staging: torch.Tensor | None = None
         self.debug_steps = 0
         self.debug_fallbacks = 0
-        self.debug_attn_checks = 0
+        self.debug_checks = 0
+
+    def decode_cu_seqlens(self, rows: int, device) -> torch.Tensor:
+        """[0, 1, 2, ... rows] -- decode rows carry exactly one query token each."""
+        cached = getattr(self, "_cu", None)
+        if cached is None or cached.numel() <= rows or cached.device != device:
+            cached = torch.arange(max(rows + 1, 256), dtype=torch.int32, device=device)
+            self._cu = cached
+        return cached[: rows + 1]
 
     def staging(self, rows: int, row_elems: int) -> torch.Tensor:
         """Pinned staging buffer for the refresh fetch, so the host->GPU copy is a DMA
@@ -115,9 +125,8 @@ class CascadeRuntime:
         return buf[:rows]
 
     # ---- CPU store ----
-    # Head-major ([Hkv, tokens, 2D]) so one head's 16-token block is a single
-    # contiguous 8 KB row: the refresh gather becomes bulk row copies instead of
-    # scattered element indexing (measured 40-45 ms per layer, 90% of refresh cost).
+    # Head-major ([Hkv, tokens, 2D]) so one group's 16-token block is a single
+    # contiguous 8 KB row: the refresh gather is bulk row copies, not scattered indexing.
     def pool_layer(self, layer: int) -> torch.Tensor:
         """[num_seqs, Hkv, max_len, 2D] pinned, allocated on first use."""
         if self.pool[layer] is None:
@@ -163,7 +172,7 @@ class CascadeRuntime:
         old = self.states.pop(key, None)
         if old is not None:
             self._release(old)
-        state = RequestState(b_end=torch.full((self.L, self.Hkv), self.S, dtype=torch.int32),
+        state = RequestState(sel_len=torch.zeros(self.L, self.Hkv, dtype=torch.int32),
                              small=[None] * self.L)
         self.states[key] = state
         return state
@@ -213,8 +222,6 @@ class CascadeRuntime:
             plan.states[r] = state
             plan.prefill_rows.append(r)
 
-        a_end: list[int] = []
-        slot_idx: list[int] = []
         for r in range(nd):
             state = self.states[keys[r]]
             plan.states[r] = state
@@ -231,47 +238,42 @@ class CascadeRuntime:
                 state.lf = n - floor_start(n)
                 state.refresh_n = n
                 plan.refresh_rows.append(r)
-                a_end.append(state.lf)
-                # This step's token still needs a working slot: it goes to where the old
-                # window would have put it, and the refresh's floor shift then moves it into
-                # place. At the first refresh there is no old window and the floor comes from
-                # the CPU store, which already has this token.
-                slot_idx.append(-1 if state.prev_refresh_n == 0
-                                else state.prev_lf + (n - 1 - state.prev_refresh_n))
-            else:
-                end = state.lf + (n - state.refresh_n)
-                assert end <= self.S, f"cascade: {end} slots since refresh exceed floor+p={self.S}"
-                a_end.append(end)
-                slot_idx.append(end - 1)
         self._gc()
 
         if nd:
-            dev = m.seq_lens.device
             plan.max_decode_seq_len = max(seq[:nd])
-            plan.a_end = torch.tensor(a_end, dtype=torch.int32).to(dev)
-            idx = torch.tensor(slot_idx, dtype=torch.int64)
-            safe = idx.clamp(min=0)
-            rows = torch.arange(nd, dtype=torch.int64)
-            pages = m.block_table_tensor[rows.to(dev), (safe // self.BS).to(dev)].to(torch.int64)
-            slots = pages * self.BS + (safe % self.BS).to(dev)
-            plan.decode_slots = torch.where((idx >= 0).to(dev), slots, torch.full_like(slots, -1))
-            b_end_cpu = torch.stack([plan.states[r].b_end for r in range(nd)], dim=1)      # [L, nd, Hkv]
-            plan.b_end = b_end_cpu.to(dev)
-            # Sizes the attention kernel's per-chunk buffers to this batch, not to the
-            # worst-case budget (1024 warm-up requests x full budget ran out of memory).
-            # b_end == S means "nothing selected" and adds no slots.
-            max_a = max(a_end)
-            selected_end = torch.where(b_end_cpu > self.S, b_end_cpu, 0).amax(dim=(1, 2)).tolist()
-            plan.max_slots = [max(max_a, int(v)) for v in selected_end]
+            self._build_decode_tensors(plan, m, nd)
         if cascade.debug() and self.debug_steps < DEBUG_STEPS:
             self.debug_steps += 1
             logger.info("cascade debug step=%d reqs=%d decodes=%d prefills=%s refresh=%s flushes=%s seq=%s "
-                        "qlens=%s keys=%s a_end=%s slot_idx=%s states=%d", self.step, num_reqs, nd,
-                        plan.prefill_rows, plan.refresh_rows,
-                        [(f.row, f.slot_start, f.count, f.cpu_start) for f in plan.flushes], seq[:6],
-                        [qsl[r + 1] - qsl[r] for r in range(min(num_reqs, 6))], keys[:6], a_end[:6],
-                        slot_idx[:6], len(self.states))
+                        "qlens=%s keys=%s states=%d", self.step, num_reqs, nd, plan.prefill_rows[:6],
+                        plan.refresh_rows[:6], [(f.row, f.slot_start, f.count, f.cpu_start) for f in plan.flushes],
+                        seq[:6], [qsl[r + 1] - qsl[r] for r in range(min(num_reqs, 6))], keys[:6], len(self.states))
         return plan
+
+    def _build_decode_tensors(self, plan: StepPlan, m: CommonAttentionMetadata, nd: int) -> None:
+        """Rows are group-major (row = g * nd + r): per-group block tables, KV lengths and
+        the slot this step's token goes to, for every layer."""
+        dev = m.seq_lens.device
+        plan.bt_rows = group_block_table(m.block_table_tensor[:nd], self.Hkv)
+
+        sel = torch.stack([plan.states[r].sel_len for r in range(nd)], dim=1)          # [L, nd, Hkv]
+        # tokens since the refresh this step's plan just recorded (refresh rows: the old window,
+        # since their floor has not moved yet when the token is written)
+        tail = torch.empty(nd, dtype=torch.int32)
+        base_lf = torch.empty(nd, dtype=torch.int32)
+        for r in range(nd):
+            state = plan.states[r]
+            if r in plan.refresh_rows:
+                tail[r] = 0 if state.prev_refresh_n == 0 else plan.seq_lens[r] - state.prev_refresh_n
+                base_lf[r] = state.prev_lf
+            else:
+                tail[r] = plan.seq_lens[r] - state.refresh_n
+                base_lf[r] = state.lf
+        first_refresh = [r for r in plan.refresh_rows if plan.states[r].prev_refresh_n == 0]
+        lens, write = decode_lengths_and_slots(sel, base_lf, tail, first_refresh)      # [L, nd, Hkv]
+        plan.lens = lens.permute(0, 2, 1).reshape(self.L, nd * self.Hkv).contiguous().to(dev)
+        plan.write_slots = write.permute(0, 2, 1).reshape(self.L, nd * self.Hkv).contiguous().to(dev)
 
 
 _RUNTIME: CascadeRuntime | None = None

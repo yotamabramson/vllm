@@ -2,6 +2,11 @@
 """Decode attention over a request's working set (towards_70B_vllm/README.md,
 "Per-request working pages").
 
+SUPERSEDED, kept for the kernel tests: since each (request, KV group) became its own
+FlashAttention row (one contiguous frame per group, see ops/layout.py), the backend
+calls flash_attn_varlen_func instead of this kernel. The two-range layout below is the
+old one -- one set of pages shared by all KV heads of a layer, holes between the ranges.
+
 Each KV head h of request r attends to two slot ranges of that request's
 working pages (same physical pages for every head, different contents):
 
