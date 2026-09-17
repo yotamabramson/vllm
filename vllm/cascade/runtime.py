@@ -27,6 +27,8 @@ Refresh cadence (harness step_count): decode step t = n - prompt_len - 1 refresh
 when t % p == 0, so the first decode step after prefill refreshes.
 """
 
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -85,6 +87,57 @@ class StepPlan:
     max_decode_seq_len: int = 0
 
 
+
+class PhaseTimer:
+    """VLLM_CASCADE_TIMING=1: where a decode step's time actually goes.
+
+    CUDA events, so the GPU is never stalled to take a reading; the elapsed times are
+    only read when the window is flushed. Wall time is recorded too, because the phases
+    we suspect (the CPU-side gather, the blocking host->device copy) cost host time that
+    no device event can see. Totals are per step, summed over all layers and requests.
+    """
+
+    NAMES = ("plan", "flush", "sidecache", "write", "score", "refresh", "attn")
+
+    def __init__(self, window: int) -> None:
+        self.enabled = cascade.timing()
+        self.window = window
+        self.pairs: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self.wall: dict[str, float] = {}
+        self.steps = 0
+
+    @contextmanager
+    def track(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        yield
+        end.record()
+        self.pairs.append((name, start, end))
+        self.wall[name] = self.wall.get(name, 0.0) + (time.perf_counter() - t0) * 1000
+
+    def tick(self) -> None:
+        """One decode step done; log and reset once the window is full."""
+        if not self.enabled:
+            return
+        self.steps += 1
+        if self.steps < self.window:
+            return
+        torch.cuda.synchronize()
+        gpu: dict[str, float] = {}
+        for name, start, end in self.pairs:
+            gpu[name] = gpu.get(name, 0.0) + start.elapsed_time(end)
+        per = lambda d, k: d.get(k, 0.0) / self.steps
+        logger.info("cascade timing over %d steps, ms/step (gpu | wall): %s", self.steps,
+                    "  ".join(f"{n} {per(gpu, n):.1f}|{per(self.wall, n):.1f}" for n in self.NAMES))
+        self.pairs.clear()
+        self.wall.clear()
+        self.steps = 0
+
+
 class CascadeRuntime:
     def __init__(self, num_layers: int, num_kv_heads: int, head_size: int, block_size: int,
                  dtype: torch.dtype, max_len: int) -> None:
@@ -106,6 +159,7 @@ class CascadeRuntime:
         self.debug_steps = 0
         self.debug_fallbacks = 0
         self.debug_checks = 0
+        self.timer = PhaseTimer(window=self.p)
 
     def decode_cu_seqlens(self, rows: int, device) -> torch.Tensor:
         """[0, 1, 2, ... rows] -- decode rows carry exactly one query token each."""
@@ -242,7 +296,9 @@ class CascadeRuntime:
 
         if nd:
             plan.max_decode_seq_len = max(seq[:nd])
-            self._build_decode_tensors(plan, m, nd)
+            with self.timer.track("plan"):
+                self._build_decode_tensors(plan, m, nd)
+            self.timer.tick()
         if cascade.debug() and self.debug_steps < DEBUG_STEPS:
             self.debug_steps += 1
             logger.info("cascade debug step=%d reqs=%d decodes=%d prefills=%s refresh=%s flushes=%s seq=%s "

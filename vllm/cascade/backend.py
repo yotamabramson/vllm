@@ -100,9 +100,10 @@ class CascadeImpl(FlashAttentionImpl):
         # Thin-K for every scheduled token, positional. Its accumulator entry starts at
         # zero: side-cache blocks are recycled from finished requests. Padding slots are
         # -1 (vLLM's own cache-write kernel skips them); send those to the null block.
-        thin_kv.view(-1, thin_kv.shape[-1]).index_copy_(
-            0, thin_md.slot_mapping[:T].clamp(min=0), k_thin[:T].reshape(T, -1).to(thin_kv.dtype))
-        acc_kv.view(-1, acc_kv.shape[-1]).index_fill_(0, acc_md.slot_mapping[:T].clamp(min=0), 0.0)
+        with rt.timer.track("sidecache"):
+            thin_kv.view(-1, thin_kv.shape[-1]).index_copy_(
+                0, thin_md.slot_mapping[:T].clamp(min=0), k_thin[:T].reshape(T, -1).to(thin_kv.dtype))
+            acc_kv.view(-1, acc_kv.shape[-1]).index_fill_(0, acc_md.slot_mapping[:T].clamp(min=0), 0.0)
 
         if T > nd:
             self._positional(layer, rt, plan, query, key, value, kv_cache, attn_metadata, output, nd, T)
@@ -168,44 +169,49 @@ class CascadeImpl(FlashAttentionImpl):
         dev = query.device
 
         # Refresh rows, CPU side first: tokens since the last refresh, then this token.
-        for f in plan.flushes:
-            state = plan.states[f.row]
-            slots = state.sel_len[l].to(dev)[:, None] + torch.arange(f.slot_start, f.slot_start + f.count,
-                                                                     device=dev)[None, :]
-            kv = self._read_slots(rt, plan, f.row, slots, kv_cache)                      # [count, Hkv, 2D]
-            rt.write_cpu(l, state, f.cpu_start, kv, blocking=True)
-        for r in plan.refresh_rows:
-            rt.write_cpu(l, plan.states[r], plan.seq_lens[r] - 1,
-                         torch.cat([key[r], value[r]], dim=-1)[None], blocking=True)
+        with rt.timer.track("flush"):
+            for f in plan.flushes:
+                state = plan.states[f.row]
+                slots = state.sel_len[l].to(dev)[:, None] + torch.arange(
+                    f.slot_start, f.slot_start + f.count, device=dev)[None, :]
+                kv = self._read_slots(rt, plan, f.row, slots, kv_cache)                  # [count, Hkv, 2D]
+                rt.write_cpu(l, state, f.cpu_start, kv, blocking=True)
+            for r in plan.refresh_rows:
+                rt.write_cpu(l, plan.states[r], plan.seq_lens[r] - 1,
+                             torch.cat([key[r], value[r]], dim=-1)[None], blocking=True)
 
         # This step's K/V into each group's next working slot.
-        slots = plan.write_slots[l]                                                      # [nd * Hkv]
-        rows = torch.arange(nd * g, device=dev)
-        pages = plan.bt_rows[rows, (slots.clamp(min=0) // rt.BS)].to(torch.int64)
-        addr = torch.where(slots >= 0, pages * rt.BS + (slots % rt.BS), torch.full_like(pages, -1))
-        key_cache, value_cache = self._caches(kv_cache)
-        reshape_and_cache_flash(self._to_rows(key[:nd], g), self._to_rows(value[:nd], g),
-                                key_cache, value_cache, addr, self.kv_cache_dtype,
-                                layer._k_scale, layer._v_scale)
+        with rt.timer.track("write"):
+            slots = plan.write_slots[l]                                                  # [nd * Hkv]
+            rows = torch.arange(nd * g, device=dev)
+            pages = plan.bt_rows[rows, (slots.clamp(min=0) // rt.BS)].to(torch.int64)
+            addr = torch.where(slots >= 0, pages * rt.BS + (slots % rt.BS), torch.full_like(pages, -1))
+            key_cache, value_cache = self._caches(kv_cache)
+            reshape_and_cache_flash(self._to_rows(key[:nd], g), self._to_rows(value[:nd], g),
+                                    key_cache, value_cache, addr, self.kv_cache_dtype,
+                                    layer._k_scale, layer._v_scale)
 
         # Stage-1 score, every decode row, every step.
-        thin_score_decode(q_thin[:nd], thin_kv, thin_md.block_table[:nd], acc_kv, acc_md.block_table[:nd],
-                          thin_md.seq_lens[:nd], max_seq_len=plan.max_decode_seq_len)
+        with rt.timer.track("score"):
+            thin_score_decode(q_thin[:nd], thin_kv, thin_md.block_table[:nd], acc_kv, acc_md.block_table[:nd],
+                              thin_md.seq_lens[:nd], max_seq_len=plan.max_decode_seq_len)
 
-        for r in plan.refresh_rows:
-            self._refresh(rt, plan, l, r, kv_cache, acc_kv, acc_md.block_table[r], q_thin[r], thin_kv,
-                          thin_md.block_table[r])
+        with rt.timer.track("refresh"):
+            for r in plan.refresh_rows:
+                self._refresh(rt, plan, l, r, kv_cache, acc_kv, acc_md.block_table[r], q_thin[r], thin_kv,
+                              thin_md.block_table[r])
 
-        q_rows = self._to_rows(query[:nd], g)
-        out_rows = torch.empty_like(q_rows)
-        flash_attn_varlen_func(
-            q=q_rows, k=key_cache, v=value_cache, out=out_rows,
-            cu_seqlens_q=rt.decode_cu_seqlens(nd * g, dev), max_seqlen_q=1,
-            seqused_k=plan.lens[l], max_seqlen_k=rt.working_slots,
-            softmax_scale=self.scale, causal=False, block_table=plan.bt_rows,
-            fa_version=self.vllm_flash_attn_version,
-        )
-        output[:nd] = self._from_rows(out_rows, g, nd)
+        with rt.timer.track("attn"):
+            q_rows = self._to_rows(query[:nd], g)
+            out_rows = torch.empty_like(q_rows)
+            flash_attn_varlen_func(
+                q=q_rows, k=key_cache, v=value_cache, out=out_rows,
+                cu_seqlens_q=rt.decode_cu_seqlens(nd * g, dev), max_seqlen_q=1,
+                seqused_k=plan.lens[l], max_seqlen_k=rt.working_slots,
+                softmax_scale=self.scale, causal=False, block_table=plan.bt_rows,
+                fa_version=self.vllm_flash_attn_version,
+            )
+            output[:nd] = self._from_rows(out_rows, g, nd)
         if cascade.debug() and l == 0 and rt.debug_checks < DEBUG_CHECKS:
             rt.debug_checks += 1
             logger.info("cascade debug L0 n=%s refresh=%s lens=%s write_slots=%s", plan.seq_lens[:2],
