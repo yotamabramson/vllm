@@ -21,6 +21,15 @@ the scheduler and the workers agree):
   VLLM_CASCADE_P=64                    (full) refresh period
   VLLM_CASCADE_CPU_SEQS=4              (full) sequences the pinned CPU store holds
 Paths may be hf:<owner>/<repo>/<file> (HF dataset repo, uses HF_TOKEN).
+
+Timing-only stand-ins, for a box with no HF credentials (they change what is
+selected, never the shapes or the work done, so speed is real and accuracy is
+meaningless -- never use them for a correctness or accuracy run):
+  VLLM_CASCADE_PROJECTIONS=random              deterministic random projections
+  VLLM_CASCADE_CAPACITIES=synthetic[:L,Hkv]    capacities whose post-margin sizes
+                                               reproduce the real margin-0.3 spread
+                                               (7,792 / 15,329 / 17,568 tokens per
+                                               group, towards_70B_vllm/README.md)
 Prefix caching must be disabled in full mode.
 """
 
@@ -64,6 +73,8 @@ def projections_path() -> str:
     value = os.environ.get("VLLM_CASCADE_PROJECTIONS")
     if not value:
         raise ValueError("VLLM_CASCADE=1 requires VLLM_CASCADE_PROJECTIONS=<path.pt or hf:owner/repo/file>")
+    if value == "random":
+        return value
     return resolve_path(value)
 
 
@@ -82,11 +93,31 @@ def capacities() -> tuple[tuple[int, ...], ...]:
     value = os.environ.get("VLLM_CASCADE_CAPACITIES")
     if not value:
         raise ValueError("VLLM_CASCADE_MODE=full requires VLLM_CASCADE_CAPACITIES=<path.json or hf:...>")
-    with open(resolve_path(value)) as f:
-        base = json.load(f)
     margin = float(os.environ.get("VLLM_CASCADE_MARGIN", "0.3"))
+    if value.split(":")[0] == "synthetic":
+        base = _synthetic_base(value, margin)
+    else:
+        with open(resolve_path(value)) as f:
+            base = json.load(f)
     ctx = int(os.environ.get("VLLM_CASCADE_CALIB_CTX", "64000"))
     return tuple(tuple(min(ctx, math.ceil(k * margin)) for k in row) for row in base)
+
+
+def _synthetic_base(value: str, margin: float) -> list[list[float]]:
+    """Capacities for a timing run with no capacities file: the same shape and the same
+    spread of working-set sizes as the real margin-0.3 calibration, so every tensor and
+    every kernel launch is the size it would really be. Deterministic, no randomness.
+
+    Real margin-0.3 sizes: 7,792 min / 15,329 mean / 17,568 max tokens per KV group.
+    u^q over a uniform u has mean 1/(q+1), so q fixes the mean between min and max.
+    """
+    lo, mean, hi = 7792, 15329, 17568
+    dims = value.split(":", 1)[1] if ":" in value else "32,8"
+    layers, heads = (int(x) for x in dims.split(","))
+    n = layers * heads
+    q = (hi - lo) / (mean - lo) - 1.0
+    sizes = [lo + (hi - lo) * (i / (n - 1)) ** q for i in range(n)]
+    return [[sizes[l * heads + h] / margin for h in range(heads)] for l in range(layers)]
 
 
 def working_slots() -> int:

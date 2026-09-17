@@ -91,8 +91,18 @@ class CascadeAttention(Attention):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
-        w_q, w_k = _load_projections(projections_path())
-        w_q, w_k = w_q[self.layer_idx], w_k[self.layer_idx]
+        path = projections_path()
+        if path == "random":
+            # Timing-only stand-in (see vllm/cascade/__init__.py): same shapes and the same
+            # per-head scale as trained projections, so every kernel does the real work --
+            # but what gets selected is meaningless. Deterministic per layer.
+            gen = torch.Generator().manual_seed(1234 + self.layer_idx)
+            scale = self.head_size ** -0.5
+            w_q = torch.randn(self.w_q_thin.shape, generator=gen) * scale
+            w_k = torch.randn(self.w_k_thin.shape, generator=gen) * scale
+        else:
+            w_q, w_k = _load_projections(path)
+            w_q, w_k = w_q[self.layer_idx], w_k[self.layer_idx]
         assert w_q.shape == self.w_q_thin.shape and w_k.shape == self.w_k_thin.shape, (
             f"cascade: projections {tuple(w_q.shape)}/{tuple(w_k.shape)} do not match layer "
             f"{self.layer_idx} shapes {tuple(self.w_q_thin.shape)}/{tuple(self.w_k_thin.shape)} "
@@ -102,7 +112,7 @@ class CascadeAttention(Attention):
         self.w_k_thin = w_k.to(self.w_k_thin.device, act_dtype)
         if self.layer_idx == 0:
             # fork_tests/step3_noop.py looks for this line to prove the layer is active
-            logger.info("cascade: projections loaded (%s), mode=%s", projections_path(), cascade.mode())
+            logger.info("cascade: projections loaded (%s), mode=%s", path, cascade.mode())
 
     def project_thin(self, q_pre: torch.Tensor, k_pre: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Pre-RoPE q [T, Hq*D], k [T, Hkv*D] -> thin q [T, Hq, 32], thin k [T, Hkv, 32]
