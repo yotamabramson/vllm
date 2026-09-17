@@ -79,6 +79,7 @@ class StepPlan:
     states: list[RequestState | None] = field(default_factory=list)
     prefill_rows: list[int] = field(default_factory=list)
     refresh_rows: list[int] = field(default_factory=list)
+    score_rows: list[int] = field(default_factory=list)   # rows the stage-1 score runs on
     flushes: list[Flush] = field(default_factory=list)
     # decode tensors; rows are group-major: row = g * num_decodes + r
     bt_rows: torch.Tensor | None = None      # [nd * Hkv, blocks per group] int32
@@ -145,6 +146,7 @@ class CascadeRuntime:
         self.dtype = dtype
         self.max_len = max_len
         self.p = cascade.refresh_period()
+        self.agg, self.score_stride = cascade.aggregation()
         self.working_slots = cascade.working_slots()
         caps = cascade.capacities()
         assert len(caps) == num_layers and all(len(row) == num_kv_heads for row in caps), (
@@ -155,7 +157,9 @@ class CascadeRuntime:
         self.free_slots = list(range(self.num_seqs))
         self.states: dict[int, RequestState] = {}
         self.step = 0
-        self._staging: torch.Tensor | None = None
+        self._staging_ring: list[tuple[torch.Tensor | None, torch.cuda.Event | None]] = [(None, None)] * 2
+        self._staging_turn = 0
+        self._flush_buf: torch.Tensor | None = None
         self.debug_steps = 0
         self.debug_fallbacks = 0
         self.debug_checks = 0
@@ -169,13 +173,29 @@ class CascadeRuntime:
             self._cu = cached
         return cached[: rows + 1]
 
-    def staging(self, rows: int, row_elems: int) -> torch.Tensor:
-        """Pinned staging buffer for the refresh fetch, so the host->GPU copy is a DMA
-        from pinned memory rather than from a freshly allocated pageable tensor."""
-        buf = self._staging
+    def staging(self, rows: int, row_elems: int) -> tuple[torch.Tensor, torch.cuda.Event]:
+        """Pinned staging for a layer's refresh fetch, so the host->GPU copy is a DMA and can
+        be left in flight. Two buffers in rotation: the host fills one layer's rows while the
+        previous layer's copy is still running. The caller records the returned event after
+        its copy; this waits on the event before handing the same buffer out again."""
+        idx = self._staging_turn
+        self._staging_turn = 1 - idx
+        buf, event = self._staging_ring[idx]
+        if event is not None:
+            event.synchronize()          # the copy that last read this buffer has finished...
         if buf is None or buf.shape[0] < rows or buf.shape[1] != row_elems:
-            buf = torch.empty(max(rows, 1024), row_elems, dtype=self.dtype, pin_memory=True)
-            self._staging = buf
+            # ...which also makes it safe to drop the old buffer: no DMA is still reading it
+            buf, event = torch.empty(max(rows, 1024), row_elems, dtype=self.dtype,
+                                     pin_memory=True), torch.cuda.Event()
+            self._staging_ring[idx] = (buf, event)
+        return buf[:rows], event
+
+    def pinned_out(self, rows: int, cols: int) -> torch.Tensor:
+        """Pinned landing buffer for a layer's flush (GPU -> CPU store), same idea."""
+        buf = self._flush_buf
+        if buf is None or buf.shape[0] < rows or buf.shape[1] != cols:
+            buf = torch.empty(max(rows, 1024), cols, dtype=self.dtype, pin_memory=True)
+            self._flush_buf = buf
         return buf[:rows]
 
     # ---- CPU store ----
@@ -283,7 +303,12 @@ class CascadeRuntime:
             self.ensure_capacity(state, n)
             if state.prompt_len is None:
                 state.prompt_len = n - 1
-            if (n - state.prompt_len - 1) % self.p == 0:
+            # Distance to the refresh that will consume this step's score, so a stride
+            # always includes the refresh step itself (t == 0).
+            t = (n - state.prompt_len - 1) % self.p
+            if t % self.score_stride == 0:
+                plan.score_rows.append(r)
+            if t == 0:
                 if state.refresh_n:
                     count = n - 1 - state.refresh_n
                     if count > 0:

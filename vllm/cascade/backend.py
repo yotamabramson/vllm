@@ -19,7 +19,7 @@ Per layer, per step:
 """
 
 import math
-import time
+from dataclasses import dataclass
 
 import torch
 
@@ -27,7 +27,7 @@ import vllm.cascade as cascade
 from vllm.cascade import SEL_BLOCK
 from vllm.cascade import THIN_WIDTH as THIN
 from vllm.cascade.ops.layout import (floor_shift, group_block_table, refresh_slots, row_of,
-                                     slot_pages)
+                                     shift_indices, slot_pages)
 from vllm.cascade.ops.score import thin_score_decode
 from vllm.cascade.ops.select import select_blocks
 from vllm.cascade.runtime import CascadeRuntime, StepPlan, get_runtime
@@ -43,6 +43,21 @@ from vllm.v1.attention.backends.flash_attn import (
 
 logger = init_logger(__name__)
 DEBUG_CHECKS = 8
+
+
+@dataclass
+class _Pick:
+    """One (request, layer) refresh, carried across the batched phases below."""
+    r: int
+    n: int
+    ids: torch.Tensor            # [Hkv, K] selected block ids, on the GPU
+    counts: torch.Tensor         # [Hkv] blocks kept per group (CPU)
+    fs: int                      # first token of the recency floor
+    state: object
+    sel_old: torch.Tensor        # [Hkv] int32 selected tokens before this refresh
+    sel_new: torch.Tensor        # [Hkv] int32 after it
+    lf: int                      # floor length
+    ids_cpu: torch.Tensor | None = None
 
 
 class CascadeMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -170,15 +185,8 @@ class CascadeImpl(FlashAttentionImpl):
 
         # Refresh rows, CPU side first: tokens since the last refresh, then this token.
         with rt.timer.track("flush"):
-            for f in plan.flushes:
-                state = plan.states[f.row]
-                slots = state.sel_len[l].to(dev)[:, None] + torch.arange(
-                    f.slot_start, f.slot_start + f.count, device=dev)[None, :]
-                kv = self._read_slots(rt, plan, f.row, slots, kv_cache)                  # [count, Hkv, 2D]
-                rt.write_cpu(l, state, f.cpu_start, kv, blocking=True)
-            for r in plan.refresh_rows:
-                rt.write_cpu(l, plan.states[r], plan.seq_lens[r] - 1,
-                             torch.cat([key[r], value[r]], dim=-1)[None], blocking=True)
+            if plan.refresh_rows:
+                self._flush_layer(rt, plan, l, kv_cache, key, value)
 
         # This step's K/V into each group's next working slot.
         with rt.timer.track("write"):
@@ -191,15 +199,25 @@ class CascadeImpl(FlashAttentionImpl):
                                     key_cache, value_cache, addr, self.kv_cache_dtype,
                                     layer._k_scale, layer._v_scale)
 
-        # Stage-1 score, every decode row, every step.
+        # Stage-1 score. Which rows it runs on is the aggregation setting: every row every
+        # step for "mean", only the rows at a stride step (the refresh step included) for
+        # "stride:N" and "last". The divisor is never applied -- every token of a group is
+        # summed over the same steps, and top-K does not see a uniform scale.
         with rt.timer.track("score"):
-            thin_score_decode(q_thin[:nd], thin_kv, thin_md.block_table[:nd], acc_kv, acc_md.block_table[:nd],
-                              thin_md.seq_lens[:nd], max_seq_len=plan.max_decode_seq_len)
+            if len(plan.score_rows) == nd:
+                sl = slice(0, nd)
+                thin_score_decode(q_thin[sl], thin_kv, thin_md.block_table[sl], acc_kv,
+                                  acc_md.block_table[sl], thin_md.seq_lens[sl],
+                                  max_seq_len=plan.max_decode_seq_len)
+            elif plan.score_rows:
+                sel_rows = torch.tensor(plan.score_rows, device=dev)
+                thin_score_decode(q_thin[sel_rows], thin_kv, thin_md.block_table[sel_rows], acc_kv,
+                                  acc_md.block_table[sel_rows], thin_md.seq_lens[sel_rows],
+                                  max_seq_len=plan.max_decode_seq_len)
 
         with rt.timer.track("refresh"):
-            for r in plan.refresh_rows:
-                self._refresh(rt, plan, l, r, kv_cache, acc_kv, acc_md.block_table[r], q_thin[r], thin_kv,
-                              thin_md.block_table[r])
+            if plan.refresh_rows:
+                self._refresh_layer(rt, plan, l, kv_cache, acc_kv, acc_md, q_thin, thin_kv, thin_md)
 
         with rt.timer.track("attn"):
             q_rows = self._to_rows(query[:nd], g)
@@ -218,107 +236,148 @@ class CascadeImpl(FlashAttentionImpl):
                         plan.refresh_rows, plan.lens[l][: min(8, nd * g)].tolist(),
                         plan.write_slots[l][: min(8, nd * g)].tolist())
 
-    def _read_slots(self, rt: CascadeRuntime, plan: StepPlan, r: int, slots: torch.Tensor,
-                    kv_cache: torch.Tensor) -> torch.Tensor:
-        """slots: [Hkv, m] working slots per group -> [m, Hkv, 2D] from the working pages."""
+    # ---- refresh: one batch of work per layer, never one per request ---------
+    def _slots_head_major(self, rt: CascadeRuntime, plan: StepPlan, r: int, slots: torch.Tensor,
+                          kv_cache: torch.Tensor) -> torch.Tensor:
+        """slots: [Hkv, m] working slots per group -> [Hkv, m, 2D], the CPU store's own order."""
         g, m = slots.shape
         rows = (torch.arange(g, device=slots.device) * plan.num_decodes + r)[:, None].expand(g, m)
-        pages = plan.bt_rows[rows.reshape(-1), (slots // rt.BS).reshape(-1)].to(torch.int64)
-        offs = (slots % rt.BS).reshape(-1)
-        kv = kv_cache[pages, 0, offs]                                                     # [g * m, 2D]
-        return kv.view(g, m, -1).transpose(0, 1)
+        addr = self._addr(rt, plan, rows.reshape(-1), slots.reshape(-1))
+        return kv_cache.view(-1, 2 * rt.D).index_select(0, addr).view(g, m, -1)
 
-    def _refresh(self, rt: CascadeRuntime, plan: StepPlan, l, r, kv_cache, acc_kv, acc_bt_row, q_thin_row,
-                 thin_kv, thin_bt_row):
-        n = plan.seq_lens[r]
-        state = plan.states[r]
-        dev = kv_cache.device
-        acc_pages = acc_bt_row[: (n + acc_kv.shape[1] - 1) // acc_kv.shape[1]].long()
-        acc = acc_kv[acc_pages].reshape(-1, rt.Hkv)[:n]
-        ids, counts, fs = select_blocks(acc, n, rt.caps[l])
-        if cascade.debug() and r == 0 and l in (0, 15, 31) and state.prompt_len == n - 1:
-            self._debug_select(rt, l, n, acc, ids, counts, q_thin_row, thin_kv, thin_bt_row)
-        acc_kv[acc_pages] = 0
+    def _flush_layer(self, rt: CascadeRuntime, plan: StepPlan, l, kv_cache, key, value) -> None:
+        """Tokens decoded since the last refresh, plus this step's own token, into the CPU
+        store -- one gather and ONE device->host copy for every refreshing request in this
+        layer. Per request it was a pipeline drain each: 256 of them per refresh step at N=8.
+        """
+        dev, g, D2 = kv_cache.device, rt.Hkv, 2 * rt.D
+        parts, meta = [], []
+        for f in plan.flushes:
+            state = plan.states[f.row]
+            slots = state.sel_len[l].to(dev)[:, None] + torch.arange(
+                f.slot_start, f.slot_start + f.count, device=dev)[None, :]
+            parts.append(self._slots_head_major(rt, plan, f.row, slots, kv_cache).reshape(-1, D2))
+            meta.append((state, f.cpu_start, f.count))
+        for r in plan.refresh_rows:
+            parts.append(torch.cat([key[r], value[r]], dim=-1).reshape(-1, D2))           # [g, 2D]
+            meta.append((plan.states[r], plan.seq_lens[r] - 1, 1))
+        packed = parts[0] if len(parts) == 1 else torch.cat(parts)
+        host = rt.pinned_out(packed.shape[0], D2)
+        host.copy_(packed)
+        at = 0
+        for state, start, count in meta:
+            rt.cpu_layer(l, state)[:, start:start + count].copy_(host[at:at + g * count].view(g, count, D2))
+            at += g * count
 
-        t_start = time.perf_counter()
-        pool = rt.cpu_layer(l, state)                                                    # [Hkv, capacity, 2D]
-        lf = n - fs
-        sel_old = state.sel_len[l].clone()
-        sel_new = (counts * SEL_BLOCK).to(torch.int32)
-        first = state.prev_refresh_n == 0
+    def _refresh_layer(self, rt: CascadeRuntime, plan: StepPlan, l, kv_cache, acc_kv, acc_md,
+                       q_thin, thin_kv, thin_md) -> None:
+        dev, g, D2 = kv_cache.device, rt.Hkv, 2 * rt.D
+        kv_flat = kv_cache.view(-1, D2)
+        acc_bs = acc_kv.shape[1]
+        nd = plan.num_decodes
 
-        # Floor: on the first refresh the working pages still hold the prompt positionally,
-        # so it comes from the CPU store; afterwards it is already on the GPU (floor plus the
-        # tokens decoded since), contiguous from slot sel_old, so it is shifted in place.
-        prev_fs = state.prev_refresh_n - state.prev_lf
-        for gi in range(rt.Hkv):
-            src0, dst0, length = floor_shift(int(sel_old[gi]), int(sel_new[gi]), prev_fs, fs, lf)
-            dst = dst0 + torch.arange(length, device=dev)
-            if first:
-                data = pool[gi, fs:n].to(dev)                                            # [lf, 2D]
-            else:
-                data = self._slot_view(rt, plan, r, gi, src0 + torch.arange(length, device=dev), kv_cache)
-            self._slot_write(rt, plan, r, gi, dst, data, kv_cache)
-        t_floor = time.perf_counter()
+        # Selection for every refreshing request: GPU only, nothing read back yet.
+        picks = []
+        for r in plan.refresh_rows:
+            n = plan.seq_lens[r]
+            pages = acc_md.block_table[r][: (n + acc_bs - 1) // acc_bs].long()
+            acc = acc_kv[pages].reshape(-1, g)[:n]
+            ids, counts, fs = select_blocks(acc, n, rt.caps[l])
+            state = plan.states[r]
+            if cascade.debug() and r == 0 and l in (0, 15, 31) and state.prompt_len == n - 1:
+                self._debug_select(rt, l, n, acc, ids, counts, q_thin[r], thin_kv, thin_md.block_table[r])
+            acc_kv[pages] = 0
+            picks.append(_Pick(r=r, n=n, ids=ids, counts=counts, fs=fs, state=state,
+                               sel_old=state.sel_len[l].clone(),
+                               sel_new=(counts * SEL_BLOCK).to(torch.int32), lf=n - fs))
 
-        # Selected blocks: fetch only blocks that are not resident already, into the slots
-        # whose blocks were dropped (measured overlap between refreshes: 85-99%).
-        ids_cpu = ids.cpu()
-        k_max = ids_cpu.shape[1]
-        resident = state.resident.get(l)
-        if resident is None or resident.shape[1] < k_max:
-            grown = torch.full((rt.Hkv, k_max), -1, dtype=torch.int64)
-            if resident is not None:
-                grown[:, : resident.shape[1]] = resident
-            resident = grown
-        need_per_group, free_per_group = [], []
-        for gi in range(rt.Hkv):
-            need, free = refresh_slots(resident[gi], ids_cpu[gi], int(counts[gi]))
-            need_per_group.append(need)
-            free_per_group.append(free)
-        state.resident[l] = resident
-        fetched = int(sum(x.numel() for x in need_per_group))
+        # ONE device->host sync for every request's selected block ids.
+        flat = torch.cat([pk.ids.reshape(-1) for pk in picks]).cpu()
+        at = 0
+        for pk in picks:
+            k = pk.ids.shape[1]
+            pk.ids_cpu = flat[at:at + g * k].view(g, k)
+            at += g * k
 
-        row_elems = SEL_BLOCK * 2 * rt.D
-        t_gather = t_h2d = t_floor
-        if fetched:
-            blocks = pool.view(rt.Hkv, -1, row_elems)                                    # [Hkv, blocks, 8KB row]
-            staging = rt.staging(fetched, row_elems)
-            at = 0
-            for gi, need in enumerate(need_per_group):
+        # Floor: already on the GPU (the floor plus the tokens decoded since), contiguous from
+        # sel_old, so it is shifted in place -- every request and group in one gather and one
+        # scatter. On a request's FIRST refresh the working pages still hold the prompt
+        # positionally, so that floor comes from the CPU store instead.
+        src0, dst0, lens, rows, firsts = [], [], [], [], []
+        for pk in picks:
+            if pk.state.prev_refresh_n == 0:
+                firsts.append(pk)
+                continue
+            prev_fs = pk.state.prev_refresh_n - pk.state.prev_lf
+            for gi in range(g):
+                a, b, length = floor_shift(int(pk.sel_old[gi]), int(pk.sel_new[gi]), prev_fs, pk.fs, pk.lf)
+                src0.append(a)
+                dst0.append(b)
+                lens.append(length)
+                rows.append(row_of(gi, pk.r, nd))
+        if src0:
+            src, dst = shift_indices(src0, dst0, lens, dev)
+            row_idx = torch.tensor(rows, device=dev)[:, None].expand(-1, src.shape[1]).reshape(-1)
+            dst_addr = self._addr(rt, plan, row_idx, dst.reshape(-1))
+            src_addr = self._addr(rt, plan, row_idx, src.reshape(-1))
+            kv_flat.index_copy_(0, dst_addr, kv_flat.index_select(0, src_addr))
+        for pk in firsts:
+            pool = rt.cpu_layer(l, pk.state)
+            data = pool[:, pk.fs:pk.n].to(dev).reshape(-1, D2)
+            row_idx = torch.repeat_interleave(
+                torch.tensor([row_of(gi, pk.r, nd) for gi in range(g)], device=dev), pk.lf)
+            slots = (pk.sel_new.to(dev)[:, None] + torch.arange(pk.lf, device=dev)[None, :]).reshape(-1)
+            kv_flat.index_copy_(0, self._addr(rt, plan, row_idx, slots), data)
+
+        # Selected blocks: fetch only what is not resident already (measured overlap between
+        # refreshes: 85-99%), for every request at once -- one host gather, one host->device
+        # copy left in flight, one scatter.
+        fetches, total = [], 0
+        for pk in picks:
+            k_max = pk.ids_cpu.shape[1]
+            resident = pk.state.resident.get(l)
+            if resident is None or resident.shape[1] < k_max:
+                grown = torch.full((g, k_max), -1, dtype=torch.int64)
+                if resident is not None:
+                    grown[:, : resident.shape[1]] = resident
+                resident = grown
+            for gi in range(g):
+                need, free = refresh_slots(resident[gi], pk.ids_cpu[gi], int(pk.counts[gi]))
                 if need.numel():
-                    torch.index_select(blocks[gi], 0, need, out=staging[at:at + need.numel()])
-                    at += need.numel()
-            t_gather = time.perf_counter()
-            data = staging.to(dev, non_blocking=False).view(-1, SEL_BLOCK, 2 * rt.D)
-            t_h2d = time.perf_counter()
+                    fetches.append((pk, gi, need, free))
+                    total += need.numel()
+            pk.state.resident[l] = resident
+        if total:
+            row_elems = SEL_BLOCK * D2
+            host, event = rt.staging(total, row_elems)
             at = 0
-            for gi, free in enumerate(free_per_group):
-                if free.numel():
-                    dst = (free.to(dev)[:, None] * SEL_BLOCK
-                           + torch.arange(SEL_BLOCK, device=dev)[None, :]).reshape(-1)
-                    self._slot_write(rt, plan, r, gi, dst, data[at:at + free.numel()].reshape(-1, 2 * rt.D),
-                                     kv_cache)
-                    at += free.numel()
+            dst_slots, dst_rows = [], []
+            for pk, gi, need, free in fetches:
+                blocks = rt.cpu_layer(l, pk.state).view(g, -1, row_elems)
+                torch.index_select(blocks[gi], 0, need, out=host[at:at + need.numel()])
+                at += need.numel()
+                dst_slots.append((free[:, None] * SEL_BLOCK + torch.arange(SEL_BLOCK)[None, :]).reshape(-1))
+                dst_rows.append(torch.full((free.numel() * SEL_BLOCK,), row_of(gi, pk.r, nd)))
+            data = host.to(dev, non_blocking=True).view(-1, D2)
+            event.record()
+            addr = self._addr(rt, plan, torch.cat(dst_rows).to(dev), torch.cat(dst_slots).to(dev))
+            kv_flat.index_copy_(0, addr, data)
 
-        state.sel_len[l] = sel_new
-        plan.lens[l][torch.arange(rt.Hkv, device=dev) * plan.num_decodes + r] = (sel_new + lf).to(dev)
-        if cascade.debug() and r == 0 and l in (0, 15, 31):
-            self._debug_refresh(rt, state, l, n, ids, counts, fetched, time.perf_counter() - t_start,
-                                t_floor - t_start, t_gather - t_floor, t_h2d - t_gather)
+        # New frame lengths, all requests in one write.
+        idx = torch.tensor([row_of(gi, pk.r, nd) for pk in picks for gi in range(g)], device=dev)
+        plan.lens[l][idx] = torch.cat([(pk.sel_new + pk.lf) for pk in picks]).to(dev)
+        for pk in picks:
+            pk.state.sel_len[l] = pk.sel_new
+            if cascade.debug() and pk.r == 0 and l in (0, 15, 31):
+                self._debug_refresh(rt, pk.state, l, pk.n, pk.ids, pk.counts, total)
+
 
     # ---- slot helpers --------------------------------------------------------
-    def _slot_addr(self, rt: CascadeRuntime, plan: StepPlan, r: int, gi: int, slots: torch.Tensor):
-        rows = torch.full_like(slots, row_of(gi, r, plan.num_decodes))
-        return slot_pages(plan.bt_rows, rows, slots, rt.BS)
-
-    def _slot_view(self, rt, plan, r, gi, slots, kv_cache) -> torch.Tensor:
-        pages, offs = self._slot_addr(rt, plan, r, gi, slots)
-        return kv_cache[pages, 0, offs]
-
-    def _slot_write(self, rt, plan, r, gi, slots, data, kv_cache) -> None:
-        pages, offs = self._slot_addr(rt, plan, r, gi, slots)
-        kv_cache[pages, 0, offs] = data
+    def _addr(self, rt: CascadeRuntime, plan: StepPlan, rows: torch.Tensor,
+              slots: torch.Tensor) -> torch.Tensor:
+        """Flat index of each (row, slot) into kv_cache.view(-1, 2D)."""
+        pages, offs = slot_pages(plan.bt_rows, rows, slots, rt.BS)
+        return pages * rt.BS + offs
 
     # ---- debug ---------------------------------------------------------------
     def _debug_select(self, rt: CascadeRuntime, l, n, acc, ids, counts, q_thin_row, thin_kv, thin_bt_row):
@@ -339,10 +398,10 @@ class CascadeImpl(FlashAttentionImpl):
         logger.info("cascade debug select L%d n=%d acc_vs_formula_max_rel=%.3e counts=%s ref_counts=%s "
                     "overlap_per_group=%s", l, n, rel, counts.tolist(), ref_counts.tolist(), overlap)
 
-    def _debug_refresh(self, rt: CascadeRuntime, state, l, n, ids, counts, fetched, total_s, floor_s, gather_s,
-                       h2d_s):
-        """Per refresh: how much of the new selection was already selected last time (delta size),
-        and where the refresh time goes (floor, CPU gather, host->GPU transfer)."""
+    def _debug_refresh(self, rt: CascadeRuntime, state, l, n, ids, counts, fetched):
+        """Per refresh: how much of the new selection was already selected last time -- the delta
+        the fetch has to move. Where the time goes is VLLM_CASCADE_TIMING=1 now, since the phases
+        are batched across requests and no longer have a per-request cost to attribute."""
         ids_cpu = ids.cpu()
         prev = state.prev_ids.get(l)
         overlap = None
@@ -356,10 +415,8 @@ class CascadeImpl(FlashAttentionImpl):
             overlap = round(kept / max(1, total), 4)
         state.prev_ids[l] = ids_cpu
         mb = fetched * SEL_BLOCK * rt.D * 2 * 2 / 2**20
-        logger.info("cascade refresh L%d n=%d selected_blocks=%d fetched_blocks=%d (%.1fMB) total=%.0fms "
-                    "floor=%.0fms gather=%.0fms h2d=%.0fms overlap_with_previous=%s",
-                    l, n, int(counts.sum()), fetched, mb, total_s * 1e3, floor_s * 1e3, gather_s * 1e3,
-                    h2d_s * 1e3, overlap)
+        logger.info("cascade refresh L%d n=%d selected_blocks=%d fetched_blocks=%d (%.1fMB, this layer, "
+                    "all requests) overlap_with_previous=%s", l, n, int(counts.sum()), fetched, mb, overlap)
 
 
 class CascadeBackend(FlashAttentionBackend):

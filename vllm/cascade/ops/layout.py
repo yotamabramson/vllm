@@ -92,3 +92,22 @@ def refresh_slots(resident_row: torch.Tensor, new_ids: torch.Tensor,
     assert need.numel() == free.numel(), f"cascade: refresh slots {need.numel()} != {free.numel()}"
     resident_row[free] = need
     return need, free
+
+
+def shift_indices(src0: list[int], dst0: list[int], lengths: list[int],
+                  device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Source and destination slots for a batch of floor shifts, one row per (request, group).
+
+    Every row moves `lengths[i]` slots from src0[i] to dst0[i], but the rows have different
+    lengths, so they are padded to the widest and the padding entries are made to copy a slot
+    ONTO ITSELF -- a no-op. That keeps the whole batch in one gather and one scatter;
+    compacting the index list instead would need the lengths on the host, i.e. a sync.
+
+    Returns (src, dst), each [rows, max(lengths)].
+    """
+    width = max(lengths)
+    base = torch.arange(width, device=device)[None, :]
+    dst = torch.tensor(dst0, device=device)[:, None] + base
+    valid = base < torch.tensor(lengths, device=device)[:, None]
+    src = torch.where(valid, torch.tensor(src0, device=device)[:, None] + base, dst)
+    return src, dst

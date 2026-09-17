@@ -19,6 +19,7 @@ the scheduler and the workers agree):
   VLLM_CASCADE_MARGIN=0.3              (full) capacity margin
   VLLM_CASCADE_CALIB_CTX=64000         (full) context the capacities were calibrated at
   VLLM_CASCADE_P=64                    (full) refresh period
+  VLLM_CASCADE_AGG=mean|last|stride:N  (full) which steps the stage-1 score runs on
   VLLM_CASCADE_CPU_SEQS=4              (full) sequences the pinned CPU store holds
 Paths may be hf:<owner>/<repo>/<file> (HF dataset repo, uses HF_TOKEN).
 
@@ -76,6 +77,35 @@ def projections_path() -> str:
     if value == "random":
         return value
     return resolve_path(value)
+
+
+def aggregation() -> tuple[str, int]:
+    """VLLM_CASCADE_AGG: which decode steps the stage-1 score runs on.
+
+      mean     (default) every step, averaged over the window -- the harness's behavior
+      stride:N every Nth step of the window, including the refresh step
+      last     the refresh step only -- 1 step in 64 at p=64
+
+    Measured on qwen2.5-7b/ctx=8000/p=64/margin 0.3 (new_degisn/exp_agg_variants.py):
+    stride:8 costs 0.03 points of coverage, last costs 0.27, against 66.48 for mean.
+    The divisor never matters: every token of a group is divided by the same count, and
+    top-K is invariant to that. Normalization WITHIN a step still does matter (the score
+    maxes over query heads that each have their own softmax denominator), so the kernel
+    keeps both of its passes -- it just runs on fewer steps.
+
+    Returns (name, stride) where stride is the step period, p for "last".
+    """
+    value = os.environ.get("VLLM_CASCADE_AGG", "mean")
+    if value == "mean":
+        return "mean", 1
+    if value == "last":
+        return "last", refresh_period()
+    if value.startswith("stride:"):
+        n = int(value.split(":", 1)[1])
+        assert n >= 1 and refresh_period() % n == 0, (
+            f"VLLM_CASCADE_AGG=stride:{n} must divide p={refresh_period()}")
+        return "stride", n
+    raise ValueError(f"VLLM_CASCADE_AGG must be mean, last or stride:N, got {value!r}")
 
 
 def refresh_period() -> int:
