@@ -165,6 +165,29 @@ def timing() -> bool:
     return os.environ.get("VLLM_CASCADE_TIMING", "0") == "1"
 
 
+def signature() -> str:
+    """Everything about the cascade configuration that changes the compiled graph or the
+    shapes the attention op works on.
+
+    vLLM's compile-cache key is built from its OWN environment variables and config, so it
+    cannot see ours: a stock engine and a cascade engine sharing a cache directory produce
+    the same key, and whichever compiles first wins. The other then silently executes the
+    wrong graph -- a cascade engine running stock's graph attends over a KV cache truncated
+    to the working budget and emits fluent nonsense, with no error anywhere
+    (towards_70B_vllm/README.md, "The compile-cache collision"). This string goes into that
+    key so the two can never collide.
+    """
+    if not is_enabled():
+        return "cascade:off"
+    parts = [mode(), f"p={refresh_period()}", f"agg={os.environ.get('VLLM_CASCADE_AGG', 'mean')}"]
+    if mode() == "full":
+        parts += [f"margin={os.environ.get('VLLM_CASCADE_MARGIN', '0.3')}",
+                  f"ctx={os.environ.get('VLLM_CASCADE_CALIB_CTX', '64000')}",
+                  f"proj={os.environ.get('VLLM_CASCADE_PROJECTIONS', '')}",
+                  f"caps={os.environ.get('VLLM_CASCADE_CAPACITIES', '')}"]
+    return "cascade:" + "|".join(parts)
+
+
 def debug() -> bool:
     """VLLM_CASCADE_DEBUG=1: log per-step plans and layer-0 consistency checks (slow)."""
     return os.environ.get("VLLM_CASCADE_DEBUG", "0") == "1"

@@ -85,6 +85,11 @@ class StepPlan:
     bt_rows: torch.Tensor | None = None      # [nd * Hkv, blocks per group] int32
     lens: torch.Tensor | None = None         # [L, nd * Hkv] int32: KV length of each row
     write_slots: torch.Tensor | None = None  # [L, nd * Hkv] int32: this token's slot (-1 = skip)
+    write_addr: torch.Tensor | None = None   # [L, nd * Hkv] int64: where that slot lands in the pages
+    # side-cache slot mappings, clamped once per step instead of once per layer
+    thin_slots: torch.Tensor | None = None
+    acc_slots: torch.Tensor | None = None
+    slots_src: torch.Tensor | None = None
     max_decode_seq_len: int = 0
 
 
@@ -355,6 +360,12 @@ class CascadeRuntime:
         lens, write = decode_lengths_and_slots(sel, base_lf, tail, first_refresh)      # [L, nd, Hkv]
         plan.lens = lens.permute(0, 2, 1).reshape(self.L, nd * self.Hkv).contiguous().to(dev)
         plan.write_slots = write.permute(0, 2, 1).reshape(self.L, nd * self.Hkv).contiguous().to(dev)
+        # Every layer writes its token to the same row of a different slot, so the page
+        # lookup is one batched computation per step rather than one per layer.
+        rows = torch.arange(nd * self.Hkv, device=dev)[None, :].expand(self.L, -1)
+        pages = plan.bt_rows[rows, plan.write_slots.clamp(min=0) // self.BS].to(torch.int64)
+        plan.write_addr = torch.where(plan.write_slots >= 0, pages * self.BS + plan.write_slots % self.BS,
+                                      torch.full_like(pages, -1))
 
 
 _RUNTIME: CascadeRuntime | None = None

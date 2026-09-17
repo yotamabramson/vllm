@@ -116,9 +116,14 @@ class CascadeImpl(FlashAttentionImpl):
         # zero: side-cache blocks are recycled from finished requests. Padding slots are
         # -1 (vLLM's own cache-write kernel skips them); send those to the null block.
         with rt.timer.track("sidecache"):
+            # Every layer's side caches share one slot mapping, so clamp it once per step.
+            if plan.slots_src is not thin_md.slot_mapping:
+                plan.slots_src = thin_md.slot_mapping
+                plan.thin_slots = thin_md.slot_mapping[:T].clamp(min=0)
+                plan.acc_slots = acc_md.slot_mapping[:T].clamp(min=0)
             thin_kv.view(-1, thin_kv.shape[-1]).index_copy_(
-                0, thin_md.slot_mapping[:T].clamp(min=0), k_thin[:T].reshape(T, -1).to(thin_kv.dtype))
-            acc_kv.view(-1, acc_kv.shape[-1]).index_fill_(0, acc_md.slot_mapping[:T].clamp(min=0), 0.0)
+                0, plan.thin_slots, k_thin[:T].reshape(T, -1).to(thin_kv.dtype))
+            acc_kv.view(-1, acc_kv.shape[-1]).index_fill_(0, plan.acc_slots, 0.0)
 
         if T > nd:
             self._positional(layer, rt, plan, query, key, value, kv_cache, attn_metadata, output, nd, T)
@@ -190,13 +195,9 @@ class CascadeImpl(FlashAttentionImpl):
 
         # This step's K/V into each group's next working slot.
         with rt.timer.track("write"):
-            slots = plan.write_slots[l]                                                  # [nd * Hkv]
-            rows = torch.arange(nd * g, device=dev)
-            pages = plan.bt_rows[rows, (slots.clamp(min=0) // rt.BS)].to(torch.int64)
-            addr = torch.where(slots >= 0, pages * rt.BS + (slots % rt.BS), torch.full_like(pages, -1))
             key_cache, value_cache = self._caches(kv_cache)
             reshape_and_cache_flash(self._to_rows(key[:nd], g), self._to_rows(value[:nd], g),
-                                    key_cache, value_cache, addr, self.kv_cache_dtype,
+                                    key_cache, value_cache, plan.write_addr[l], self.kv_cache_dtype,
                                     layer._k_scale, layer._v_scale)
 
         # Stage-1 score. Which rows it runs on is the aggregation setting: every row every

@@ -582,6 +582,13 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     config_hash = vllm_config.compute_hash()
     factors.append(config_hash)
 
+    # 1b. cascaded attention is configured by its own environment variables, which nothing
+    #     above can see -- without this a stock and a cascade engine share one cache entry
+    #     and the second one silently runs the first one's graph (vllm/cascade/__init__.py).
+    import vllm.cascade as cascade
+
+    factors.append(cascade.signature())
+
     # 2. inductor factors if applicable
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
         factors.extend(get_inductor_factors())
