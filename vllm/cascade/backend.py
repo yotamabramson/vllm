@@ -26,7 +26,8 @@ import torch
 import vllm.cascade as cascade
 from vllm.cascade import SEL_BLOCK
 from vllm.cascade import THIN_WIDTH as THIN
-from vllm.cascade.ops.layout import floor_shift, group_block_table, row_of, slot_pages
+from vllm.cascade.ops.layout import (floor_shift, group_block_table, refresh_slots, row_of,
+                                     slot_pages)
 from vllm.cascade.ops.score import thin_score_decode
 from vllm.cascade.ops.select import select_blocks
 from vllm.cascade.runtime import CascadeRuntime, StepPlan, get_runtime
@@ -266,14 +267,7 @@ class CascadeImpl(FlashAttentionImpl):
             resident = grown
         need_per_group, free_per_group = [], []
         for gi in range(rt.Hkv):
-            cnt = int(counts[gi])
-            new_g = ids_cpu[gi, :cnt]
-            old_g = resident[gi]
-            need = new_g[~torch.isin(new_g, old_g)] if cnt else new_g[:0]
-            free = (~torch.isin(old_g, new_g)).nonzero(as_tuple=True)[0]
-            free = free[free < cnt][: need.numel()]
-            need = need[: free.numel()]
-            old_g[free] = need
+            need, free = refresh_slots(resident[gi], ids_cpu[gi], int(counts[gi]))
             need_per_group.append(need)
             free_per_group.append(free)
         state.resident[l] = resident

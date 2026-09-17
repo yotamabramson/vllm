@@ -70,3 +70,25 @@ def floor_shift(sel_old: int, sel_new: int, prev_floor_start: int, floor_start: 
     """Moving the floor after a refresh: the tokens it now covers are already on the GPU,
     laid out from sel_old by the previous frame. Returns (src start, dst start, length)."""
     return sel_old + (floor_start - prev_floor_start), sel_new, length
+
+
+def refresh_slots(resident_row: torch.Tensor, new_ids: torch.Tensor,
+                  count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Which selected blocks a refresh must fetch, and which slots they go to.
+
+    resident_row [K] holds the block id at each selected slot of one KV group, -1 for none;
+    it is updated in place. new_ids[:count] is this refresh's selection for that group.
+
+    Only slots below `count` count as resident: the frame is [0, count) blocks long, so a
+    block sitting past it is not attended and has to come back from the CPU store. With
+    that, need and free are the same length -- both are count - |old & new| -- so every
+    dropped slot receives exactly one fetched block.
+    """
+    new_ids = new_ids.to(resident_row.dtype)
+    resident_row[count:] = -1
+    new, valid = new_ids[:count], resident_row[:count]
+    need = new[~torch.isin(new, valid)]
+    free = (~torch.isin(valid, new)).nonzero(as_tuple=True)[0]
+    assert need.numel() == free.numel(), f"cascade: refresh slots {need.numel()} != {free.numel()}"
+    resident_row[free] = need
+    return need, free
