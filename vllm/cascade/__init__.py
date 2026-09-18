@@ -86,8 +86,10 @@ def aggregation() -> tuple[str, int]:
       stride:N every Nth step of the window, including the refresh step
       last     the refresh step only -- 1 step in 64 at p=64
 
-    Measured on qwen2.5-7b/ctx=8000/p=64/margin 0.3 (new_degisn/exp_agg_variants.py):
-    stride:8 costs 0.03 points of coverage, last costs 0.27, against 66.48 for mean.
+    Measured with new_degisn/exp_agg_variants.py. On llama3.1-8b at ctx=64000, margin 0.3,
+    p=64 -- the configuration the fork actually serves -- `last` costs 0.19 points of
+    coverage against 56.19 for mean, and stride:8 costs 0.01; on qwen2.5-7b at ctx=8000 the
+    same comparison cost 0.26 and 0.02. `last` is therefore the intended setting.
     The divisor never matters: every token of a group is divided by the same count, and
     top-K is invariant to that. Normalization WITHIN a step still does matter (the score
     maxes over query heads that each have their own softmax denominator), so the kernel
