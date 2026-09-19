@@ -28,8 +28,8 @@ Nothing here is used unless the run asks for it: with VLLM_CASCADE_G=0 and
 VLLM_CASCADE_ASYNC_FLUSH=0 (both defaults) the backend takes exactly the paths it took
 before this file existed.
 
-Not tested on a GPU yet -- written without one available. The pool and scheduling
-arithmetic that can be checked on a CPU is checked in fork_tests/test_async_io.py.
+Tested on a GPU in isolation by fork_tests/test_async_io_gpu.py (inside inference_mode, as in
+the engine); the scheduling arithmetic on a CPU by fork_tests/test_gap.py.
 """
 
 import queue
@@ -155,20 +155,33 @@ class AsyncIO:
         self._thread = threading.Thread(target=self._run, name="cascade-io", daemon=True)
         self._thread.start()
         self.jobs_done = 0
+        # Jobs that raised. A failed job is logged, not propagated -- the decode step must not
+        # die because a background copy did -- so without this counter a broken worker is
+        # invisible: the very first GPU run had every flush fail while the tokens still
+        # matched (nothing re-reads a flushed token within 64 steps). Anything that judges a
+        # run must check this is 0.
+        self.failed_jobs = 0
 
     # ---- worker --------------------------------------------------------------
     def _run(self) -> None:
-        while True:
-            job = self._queue.get()
-            if job is None:
-                return
-            try:
-                job()
-            except BaseException:            # never let the worker die silently
-                logger.exception("cascade: async I/O job failed")
-            finally:
-                self.jobs_done += 1
-                self._queue.task_done()
+        # inference_mode is THREAD-LOCAL. vLLM runs the forward pass under it, so the CPU
+        # store, the slot bookkeeping and the pinned buffers the main thread hands over are
+        # "inference tensors", and a thread outside inference mode may not write into them
+        # ("Inplace update to inference tensor outside InferenceMode"). Every job runs
+        # inside it for that reason.
+        with torch.inference_mode():
+            while True:
+                job = self._queue.get()
+                if job is None:
+                    return
+                try:
+                    job()
+                except BaseException:            # never let the worker die silently
+                    self.failed_jobs += 1
+                    logger.exception("cascade: async I/O job failed")
+                finally:
+                    self.jobs_done += 1
+                    self._queue.task_done()
 
     def drain(self) -> None:
         """Wait until every submitted job has run (used on fallback batches and teardown)."""
@@ -260,9 +273,10 @@ class AsyncIO:
                     # The pinned buffer is only free once the copy reading it has finished.
                     event.synchronize()
                     self.host_pool.release(host)
-            except BaseException as e:       # the swap falls back to a synchronous refresh
+            except BaseException as e:       # the swap falls back to holding the working set
                 pending.failed = e
-                logger.exception("cascade: async fetch failed; the swap will refresh synchronously")
+                self.failed_jobs += 1
+                logger.exception("cascade: async fetch failed; the swap will hold the working set")
             finally:
                 self.id_pool.release(ids_host)
                 pending.issued.set()
