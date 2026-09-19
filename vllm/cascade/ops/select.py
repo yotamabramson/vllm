@@ -41,14 +41,34 @@ def blocks_per_head(caps_tokens: torch.Tensor, n: int, floor_min: int = FLOOR_MI
 
 
 def select_blocks(acc: torch.Tensor, n: int, caps_tokens: torch.Tensor, floor_min: int = FLOOR_MIN,
-                  block: int = SEL_BLOCK) -> tuple[torch.Tensor, torch.Tensor, int]:
+                  block: int = SEL_BLOCK, n_apply: int | None = None) -> tuple[torch.Tensor, torch.Tensor, int]:
     """acc: [n, Hkv] float32 accumulated score (GPU). caps_tokens: [Hkv] long capacity in tokens (CPU).
 
     Returns (block_ids [Hkv, K_max] long on acc's device, ascending per head, -1 past the head's count;
              counts [Hkv] long on CPU; floor_start). No GPU->CPU sync: counts come from CPU inputs.
+
+    n_apply (default n): the sequence length the selection will be SWAPPED IN at, which is
+    later than n when the selection runs early (VLLM_CASCADE_G > 0). The floor boundary
+    has to be the one in force at SWAP time: the frame is one contiguous range per group
+    with no mask, so the selected blocks and the floor must not overlap, and it is the
+    swap-time floor they will sit next to.
+
+    The floor slides forward as the sequence grows, so candidates are blocks before
+    floor_start(n_apply) -- a LARGER set than floor_start(n) would give, not a smaller
+    one. The blocks that gap adds, [floor_start(n), floor_start(n_apply)), are tokens the
+    floor still covers at selection time but will have dropped by the swap: exactly the
+    ones that have to be selected if they are to stay resident. They are fetched from the
+    CPU store like any other selected block.
+
+    `acc` must cover those candidates, which holds because the gap is far below floor_min
+    (G < p <= a few hundred, floor_min = 1000), so floor_start(n_apply) < n.
     """
-    fs = floor_start(n, floor_min, block)
-    counts = blocks_per_head(caps_tokens, n, floor_min, block)
+    fs = floor_start(n if n_apply is None else n_apply, floor_min, block)
+    assert fs <= n, (f"cascade: selecting at n={n} for apply at n={n_apply} needs scores up to "
+                     f"token {fs}, which do not exist yet -- the gap must stay well below floor_min")
+    n_cand_avail = fs // block
+    counts = (torch.zeros_like(caps_tokens) if n_cand_avail == 0
+              else (caps_tokens // block).clamp(min=1, max=n_cand_avail))
     Hkv = acc.shape[1]
     k_max = int(counts.max()) if counts.numel() else 0
     if k_max == 0:

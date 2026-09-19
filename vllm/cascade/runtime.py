@@ -34,7 +34,8 @@ from dataclasses import dataclass, field
 import torch
 
 import vllm.cascade as cascade
-from vllm.cascade.ops.layout import decode_lengths_and_slots, group_block_table
+from vllm.cascade.ops.layout import (decode_lengths_and_slots, group_block_table, selection_step,
+                                     window_step)
 from vllm.cascade.ops.select import floor_start
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -59,6 +60,7 @@ class RequestState:
     last_seen: int = 0
     resident: dict = field(default_factory=dict)   # layer -> [Hkv, K] int64: block id in each slot
     prev_ids: dict = field(default_factory=dict)   # debug only: layer -> last refresh's block ids
+    pending: dict = field(default_factory=dict)    # layer -> PendingFetch, selections in flight (G > 0)
 
 
 @dataclass
@@ -78,7 +80,8 @@ class StepPlan:
     query_start: list[int] = field(default_factory=list)
     states: list[RequestState | None] = field(default_factory=list)
     prefill_rows: list[int] = field(default_factory=list)
-    refresh_rows: list[int] = field(default_factory=list)
+    refresh_rows: list[int] = field(default_factory=list)   # rows swapping their working set in
+    select_rows: list[int] = field(default_factory=list)    # rows selecting early, G steps ahead (G > 0)
     score_rows: list[int] = field(default_factory=list)   # rows the stage-1 score runs on
     flushes: list[Flush] = field(default_factory=list)
     # decode tensors; rows are group-major: row = g * num_decodes + r
@@ -103,7 +106,7 @@ class PhaseTimer:
     no device event can see. Totals are per step, summed over all layers and requests.
     """
 
-    NAMES = ("plan", "flush", "sidecache", "write", "score", "refresh", "attn")
+    NAMES = ("plan", "flush", "sidecache", "write", "score", "select", "refresh", "attn")
 
     def __init__(self, window: int) -> None:
         self.enabled = cascade.timing()
@@ -152,6 +155,13 @@ class CascadeRuntime:
         self.max_len = max_len
         self.p = cascade.refresh_period()
         self.agg, self.score_stride = cascade.aggregation()
+        self.gap = cascade.gap()
+        # Step within the window the selection runs at, counted from the last refresh:
+        # G steps before the next one. G=0 puts it on the refresh step itself, which is
+        # the synchronous behavior this package started with.
+        self.sel_t = selection_step(self.p, self.gap)
+        self.async_flush = cascade.async_flush()
+        self._io = None
         self.working_slots = cascade.working_slots()
         caps = cascade.capacities()
         assert len(caps) == num_layers and all(len(row) == num_kv_heads for row in caps), (
@@ -169,6 +179,25 @@ class CascadeRuntime:
         self.debug_fallbacks = 0
         self.debug_checks = 0
         self.timer = PhaseTimer(window=self.p)
+
+    def io(self, device) -> "object":
+        """The worker thread and side streams, created on first use (the device is not
+        known until a real batch arrives). Only ever reached when G > 0 or the flush is
+        asynchronous, so a default run never starts a thread."""
+        if self._io is None:
+            from vllm.cascade.async_io import AsyncIO
+            self._io = AsyncIO(self.dtype, device)
+            logger.info("cascade: async I/O worker started (gap=%d, async_flush=%s)",
+                        self.gap, self.async_flush)
+        return self._io
+
+    def drop_pending(self, state: RequestState) -> None:
+        """Give back the staging buffers of selections that will never be swapped in."""
+        for pending in state.pending.values():
+            pending.wait()
+            if pending.staged is not None and self._io is not None:
+                self._io.dev_pool.release(pending.staged, pending.event)
+        state.pending.clear()
 
     def decode_cu_seqlens(self, rows: int, device) -> torch.Tensor:
         """[0, 1, 2, ... rows] -- decode rows carry exactly one query token each."""
@@ -244,6 +273,8 @@ class CascadeRuntime:
 
     # ---- request states ----
     def _release(self, state: RequestState) -> None:
+        if state.pending:
+            self.drop_pending(state)
         if state.cpu_slot is not None:
             self.free_slots.append(state.cpu_slot)
 
@@ -309,10 +340,16 @@ class CascadeRuntime:
             if state.prompt_len is None:
                 state.prompt_len = n - 1
             # Distance to the refresh that will consume this step's score, so a stride
-            # always includes the refresh step itself (t == 0).
-            t = (n - state.prompt_len - 1) % self.p
-            if t % self.score_stride == 0:
+            # always includes the step the selection runs on (t == sel_t; sel_t == 0, the
+            # refresh step itself, when G == 0).
+            t = window_step(n, state.prompt_len, self.p)
+            first_refresh = t == 0 and state.refresh_n == 0
+            if (t - self.sel_t) % self.score_stride == 0 or first_refresh:
                 plan.score_rows.append(r)
+            # Select early, G steps before the swap, so the fetch has that long to run.
+            # The first refresh has no earlier step to select at and stays synchronous.
+            if self.gap and t == self.sel_t and state.refresh_n:
+                plan.select_rows.append(r)
             if t == 0:
                 if state.refresh_n:
                     count = n - 1 - state.refresh_n

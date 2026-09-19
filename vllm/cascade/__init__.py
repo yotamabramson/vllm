@@ -20,6 +20,10 @@ the scheduler and the workers agree):
   VLLM_CASCADE_CALIB_CTX=64000         (full) context the capacities were calibrated at
   VLLM_CASCADE_P=64                    (full) refresh period
   VLLM_CASCADE_AGG=mean|last|stride:N  (full) which steps the stage-1 score runs on
+  VLLM_CASCADE_G=0                     (full) decode steps between selecting a working set
+                                       and swapping it in, so the fetch has that long to
+                                       run off the critical path (see gap() below)
+  VLLM_CASCADE_ASYNC_FLUSH=0           (full) flush to the CPU store off the critical path
   VLLM_CASCADE_CPU_SEQS=4              (full) sequences the pinned CPU store holds
 Paths may be hf:<owner>/<repo>/<file> (HF dataset repo, uses HF_TOKEN).
 
@@ -114,6 +118,55 @@ def refresh_period() -> int:
     return int(os.environ.get("VLLM_CASCADE_P", "64"))
 
 
+def gap() -> int:
+    """VLLM_CASCADE_G: decode steps between selecting a working set and swapping it in.
+
+    G=0 (default) is the behavior this package had before the option existed: the refresh
+    step scores, selects, fetches from the CPU store and attends, all in one forward pass,
+    so the step waits for the whole round trip (~15.4 ms/step amortised, measured).
+
+    G>0 splits that in two. The selection runs at q = p - G steps into the window, off
+    this step's own scores; the fetch is issued asynchronously (async_io.py) and the swap
+    happens G steps later, at the refresh step, which only waits on an event that has
+    almost certainly already completed. The transfer gets G decode steps (~40 ms each) to
+    finish instead of zero.
+
+    What it costs is staleness: the scores that choose the resident set are G steps older
+    than they would have been. Nothing else changes -- same selection rule, same capacity,
+    same floor. Pick G just large enough to cover the fetch (the measured refresh is ~1 s
+    per event at N=8 spread over 32 layers, so a handful of steps), not p/2: staleness is
+    paid one-for-one with transfer time, and there is no benefit to a bigger gap than the
+    transfer needs.
+
+    Only the gap matters, not where the selection sits in the window: the scores in use at
+    any moment are between G and G + p - 1 steps old, so (p, q) and (p, G) describe the
+    same grid. The first refresh after prefill has no earlier step to select at and stays
+    synchronous whatever G is.
+
+    Untested on a GPU: no accuracy or speed number exists for G>0 yet.
+    """
+    value = int(os.environ.get("VLLM_CASCADE_G", "0"))
+    p = refresh_period()
+    assert 0 <= value < p, f"VLLM_CASCADE_G={value} must be in [0, p={p})"
+    return value
+
+
+def async_flush() -> bool:
+    """VLLM_CASCADE_ASYNC_FLUSH=1: send the flush (GPU -> CPU store) down a side stream and
+    scatter it on the worker thread, instead of blocking the step on it.
+
+    Independent of the gap, and free of any quality effect: the flush only writes tokens
+    the CPU store will need much later (a token is only fetchable once it falls out of the
+    ~1000-token recency floor). Measured cost of the blocking version: 6.8 ms of wall time
+    per step against 0.1 ms of GPU time. Off by default only because it has not run on a
+    GPU yet."""
+    return os.environ.get("VLLM_CASCADE_ASYNC_FLUSH", "0") == "1"
+
+
+def uses_async() -> bool:
+    return is_full() and (gap() > 0 or async_flush())
+
+
 def working_start() -> int:
     """First working slot of the selected blocks (after the floor and the tokens since refresh)."""
     return FLOOR_SLOTS + refresh_period()
@@ -181,7 +234,8 @@ def signature() -> str:
     """
     if not is_enabled():
         return "cascade:off"
-    parts = [mode(), f"p={refresh_period()}", f"agg={os.environ.get('VLLM_CASCADE_AGG', 'mean')}"]
+    parts = [mode(), f"p={refresh_period()}", f"agg={os.environ.get('VLLM_CASCADE_AGG', 'mean')}",
+             f"g={os.environ.get('VLLM_CASCADE_G', '0')}"]
     if mode() == "full":
         parts += [f"margin={os.environ.get('VLLM_CASCADE_MARGIN', '0.3')}",
                   f"ctx={os.environ.get('VLLM_CASCADE_CALIB_CTX', '64000')}",

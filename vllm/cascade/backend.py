@@ -29,7 +29,8 @@ from vllm.cascade import THIN_WIDTH as THIN
 from vllm.cascade.ops.layout import (floor_shift, group_block_table, refresh_slots, row_of,
                                      shift_indices, slot_pages)
 from vllm.cascade.ops.score import thin_score_decode
-from vllm.cascade.ops.select import select_blocks
+from vllm.cascade.async_io import PendingFetch
+from vllm.cascade.ops.select import floor_start, select_blocks
 from vllm.cascade.runtime import CascadeRuntime, StepPlan, get_runtime
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -47,16 +48,26 @@ DEBUG_CHECKS = 8
 
 @dataclass
 class _Pick:
-    """One (request, layer) refresh, carried across the batched phases below."""
+    """One (request, layer) refresh, carried across the batched phases below.
+
+    `mode` says where its selection came from:
+      sync  selected in this very step from this step's scores (G=0, and every first
+            refresh whatever G is) -- it still has to fetch before it can attend
+      swap  selected G steps ago; the blocks are already on the GPU, waiting in staging
+      hold  neither: no usable early selection arrived, so the working set stays as it is
+            and only the floor moves (safety valve, should not happen in a healthy run)
+    """
     r: int
     n: int
-    ids: torch.Tensor            # [Hkv, K] selected block ids, on the GPU
-    counts: torch.Tensor         # [Hkv] blocks kept per group (CPU)
+    ids: torch.Tensor | None     # [Hkv, K] selected block ids, on the GPU (sync only)
+    counts: torch.Tensor | None  # [Hkv] blocks kept per group (CPU)
     fs: int                      # first token of the recency floor
     state: object
     sel_old: torch.Tensor        # [Hkv] int32 selected tokens before this refresh
     sel_new: torch.Tensor        # [Hkv] int32 after it
     lf: int                      # floor length
+    mode: str = "sync"
+    pending: object = None
     ids_cpu: torch.Tensor | None = None
 
 
@@ -216,6 +227,12 @@ class CascadeImpl(FlashAttentionImpl):
                                   acc_md.block_table[sel_rows], thin_md.seq_lens[sel_rows],
                                   max_seq_len=plan.max_decode_seq_len)
 
+        # Early selection (VLLM_CASCADE_G > 0): pick the next working set G steps before it
+        # is swapped in, and let the fetch run on the worker thread meanwhile.
+        with rt.timer.track("select"):
+            if plan.select_rows:
+                self._select_layer(rt, plan, l, acc_kv, acc_md)
+
         with rt.timer.track("refresh"):
             if plan.refresh_rows:
                 self._refresh_layer(rt, plan, l, kv_cache, acc_kv, acc_md, q_thin, thin_kv, thin_md)
@@ -250,6 +267,12 @@ class CascadeImpl(FlashAttentionImpl):
         """Tokens decoded since the last refresh, plus this step's own token, into the CPU
         store -- one gather and ONE device->host copy for every refreshing request in this
         layer. Per request it was a pipeline drain each: 256 of them per refresh step at N=8.
+
+        With VLLM_CASCADE_ASYNC_FLUSH=1 the copy goes out on a side stream and the
+        host-side scatter runs on the worker thread, so the step does not wait for either.
+        Nothing reads these tokens for several windows (a token is only fetchable once it
+        falls out of the ~1000-token recency floor), and the worker is FIFO, so a later
+        fetch cannot overtake this write.
         """
         dev, g, D2 = kv_cache.device, rt.Hkv, 2 * rt.D
         parts, meta = [], []
@@ -263,12 +286,58 @@ class CascadeImpl(FlashAttentionImpl):
             parts.append(torch.cat([key[r], value[r]], dim=-1).reshape(-1, D2))           # [g, 2D]
             meta.append((plan.states[r], plan.seq_lens[r] - 1, 1))
         packed = parts[0] if len(parts) == 1 else torch.cat(parts)
+        if rt.async_flush:
+            targets = [(rt.cpu_layer(l, state), g, start, count) for state, start, count in meta]
+            rt.io(dev).submit_flush(packed, targets)
+            return
         host = rt.pinned_out(packed.shape[0], D2)
         host.copy_(packed)
         at = 0
         for state, start, count in meta:
             rt.cpu_layer(l, state)[:, start:start + count].copy_(host[at:at + g * count].view(g, count, D2))
             at += g * count
+
+    # ---- early selection: choose now, swap in G steps later -------------------
+    @staticmethod
+    def _resident_row(state, l: int, groups: int, k_max: int) -> torch.Tensor:
+        """This (request, layer)'s [Hkv, K] block-id-per-slot bookkeeping, grown to k_max."""
+        resident = state.resident.get(l)
+        if resident is None or resident.shape[1] < k_max:
+            grown = torch.full((groups, k_max), -1, dtype=torch.int64)
+            if resident is not None:
+                grown[:, : resident.shape[1]] = resident
+            resident = grown
+        state.resident[l] = resident
+        return resident
+
+    def _select_layer(self, rt: CascadeRuntime, plan: StepPlan, l, acc_kv, acc_md) -> None:
+        """Select this request's next working set from the scores it has NOW, and hand the
+        fetch to the worker thread. The swap happens G steps later, in _refresh_layer.
+
+        The selection uses the floor boundary that will be in force at swap time
+        (`n_apply`), not the one in force now -- see ops/select.py -- so the set it picks is
+        disjoint from the floor the swap will install.
+        """
+        acc_bs = acc_kv.shape[1]
+        for r in plan.select_rows:
+            state = plan.states[r]
+            n = plan.seq_lens[r]
+            n_apply = n + rt.gap
+            pages = acc_md.block_table[r][: (n + acc_bs - 1) // acc_bs].long()
+            acc = acc_kv[pages].reshape(-1, rt.Hkv)[:n]
+            ids, counts, fs = select_blocks(acc, n, rt.caps[l], n_apply=n_apply)
+            acc_kv[pages] = 0
+            old = state.pending.pop(l, None)
+            if old is not None:                      # never consumed (a skipped swap); give it back
+                old.wait()
+                if old.staged is not None:
+                    rt.io(acc.device).dev_pool.release(old.staged, old.event)
+            pending = PendingFetch(n_apply=n_apply, sel_new=(counts * SEL_BLOCK).to(torch.int32),
+                                   fs=fs, lf=n_apply - fs, counts=counts)
+            state.pending[l] = pending
+            rt.io(acc.device).submit_fetch(pending, ids, rt.cpu_layer(l, state),
+                                           self._resident_row(state, l, rt.Hkv, ids.shape[1]).clone(),
+                                           SEL_BLOCK * 2 * rt.D, SEL_BLOCK)
 
     def _refresh_layer(self, rt: CascadeRuntime, plan: StepPlan, l, kv_cache, acc_kv, acc_md,
                        q_thin, thin_kv, thin_md) -> None:
@@ -277,14 +346,42 @@ class CascadeImpl(FlashAttentionImpl):
         acc_bs = acc_kv.shape[1]
         nd = plan.num_decodes
 
-        # Selection for every refreshing request: GPU only, nothing read back yet.
+        # What each refreshing request swaps in: a selection made G steps ago if one is
+        # ready, otherwise one made here and now.
         picks = []
         for r in plan.refresh_rows:
             n = plan.seq_lens[r]
+            state = plan.states[r]
+            pending = state.pending.pop(l, None)
+            if pending is not None:
+                pending.wait()                       # the worker has issued the copy by now
+            if pending is not None and pending.failed is None and pending.n_apply == n:
+                picks.append(_Pick(r=r, n=n, ids=None, counts=pending.counts, fs=pending.fs,
+                                   state=state, sel_old=state.sel_len[l].clone(),
+                                   sel_new=pending.sel_new, lf=pending.lf,
+                                   mode="swap", pending=pending))
+                continue
+            if pending is not None:
+                # Selected for a step this request never reached, or the fetch failed. The
+                # slots it would write still hold live blocks, so drop it rather than apply
+                # it to the wrong frame.
+                if pending.staged is not None:
+                    rt.io(dev).dev_pool.release(pending.staged, pending.event)
+                logger.warning("cascade: discarding an early selection for layer %d (apply n=%s, now %s, "
+                               "failed=%s)", l, pending.n_apply, n, pending.failed)
+            if rt.gap and state.prev_refresh_n:
+                # No usable selection, and with G>0 there is no score taken on this step to
+                # make one from. Keep the working set and move only the floor: every
+                # selected block lies before the previous floor start, hence before this
+                # one, so the frame stays disjoint.
+                sel_old = state.sel_len[l].clone()
+                fs = floor_start(n)
+                picks.append(_Pick(r=r, n=n, ids=None, counts=None, fs=fs, state=state,
+                                   sel_old=sel_old, sel_new=sel_old.clone(), lf=n - fs, mode="hold"))
+                continue
             pages = acc_md.block_table[r][: (n + acc_bs - 1) // acc_bs].long()
             acc = acc_kv[pages].reshape(-1, g)[:n]
             ids, counts, fs = select_blocks(acc, n, rt.caps[l])
-            state = plan.states[r]
             if cascade.debug() and r == 0 and l in (0, 15, 31) and state.prompt_len == n - 1:
                 self._debug_select(rt, l, n, acc, ids, counts, q_thin[r], thin_kv, thin_md.block_table[r])
             acc_kv[pages] = 0
@@ -292,13 +389,16 @@ class CascadeImpl(FlashAttentionImpl):
                                sel_old=state.sel_len[l].clone(),
                                sel_new=(counts * SEL_BLOCK).to(torch.int32), lf=n - fs))
 
-        # ONE device->host sync for every request's selected block ids.
-        flat = torch.cat([pk.ids.reshape(-1) for pk in picks]).cpu()
-        at = 0
-        for pk in picks:
-            k = pk.ids.shape[1]
-            pk.ids_cpu = flat[at:at + g * k].view(g, k)
-            at += g * k
+        # ONE device->host sync for every request that selected here. Rows that selected
+        # early already had their ids read back on the worker thread.
+        sync_picks = [pk for pk in picks if pk.mode == "sync"]
+        if sync_picks:
+            flat = torch.cat([pk.ids.reshape(-1) for pk in sync_picks]).cpu()
+            at = 0
+            for pk in sync_picks:
+                k = pk.ids.shape[1]
+                pk.ids_cpu = flat[at:at + g * k].view(g, k)
+                at += g * k
 
         # Floor: already on the GPU (the floor plus the tokens decoded since), contiguous from
         # sel_old, so it is shifted in place -- every request and group in one gather and one
@@ -334,20 +434,14 @@ class CascadeImpl(FlashAttentionImpl):
         # refreshes: 85-99%), for every request at once -- one host gather, one host->device
         # copy left in flight, one scatter.
         fetches, total = [], 0
-        for pk in picks:
+        for pk in sync_picks:
             k_max = pk.ids_cpu.shape[1]
-            resident = pk.state.resident.get(l)
-            if resident is None or resident.shape[1] < k_max:
-                grown = torch.full((g, k_max), -1, dtype=torch.int64)
-                if resident is not None:
-                    grown[:, : resident.shape[1]] = resident
-                resident = grown
+            resident = self._resident_row(pk.state, l, g, k_max)
             for gi in range(g):
                 need, free = refresh_slots(resident[gi], pk.ids_cpu[gi], int(pk.counts[gi]))
                 if need.numel():
                     fetches.append((pk, gi, need, free))
                     total += need.numel()
-            pk.state.resident[l] = resident
         if total:
             row_elems = SEL_BLOCK * D2
             host, event = rt.staging(total, row_elems)
@@ -364,12 +458,33 @@ class CascadeImpl(FlashAttentionImpl):
             addr = self._addr(rt, plan, torch.cat(dst_rows).to(dev), torch.cat(dst_slots).to(dev))
             kv_flat.index_copy_(0, addr, data)
 
+        # Selections fetched G steps ago: the blocks are already in GPU staging, so this is
+        # one stream wait (on a copy that has had G decode steps to finish) and one scatter.
+        for pk in picks:
+            if pk.mode != "swap":
+                continue
+            pending = pk.pending
+            if pending.resident is not None:
+                pk.state.resident[l] = pending.resident
+            if pending.staged is None:                   # nothing changed: all blocks resident
+                continue
+            torch.cuda.current_stream(dev).wait_event(pending.event)
+            rows = (pending.dst_groups * nd + pk.r).to(dev)      # the row may differ from the
+            slots = pending.dst_slots.to(dev)                    # selection step's: rebuild it
+            addr = self._addr(rt, plan, rows, slots)
+            kv_flat.index_copy_(0, addr, pending.staged.view(-1, D2))
+            pk.state.resident[l] = pending.resident      # commit the slot bookkeeping
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream(dev))
+            rt.io(dev).dev_pool.release(pending.staged, done)
+            pending.staged = None
+
         # New frame lengths, all requests in one write.
         idx = torch.tensor([row_of(gi, pk.r, nd) for pk in picks for gi in range(g)], device=dev)
         plan.lens[l][idx] = torch.cat([(pk.sel_new + pk.lf) for pk in picks]).to(dev)
         for pk in picks:
             pk.state.sel_len[l] = pk.sel_new
-            if cascade.debug() and pk.r == 0 and l in (0, 15, 31):
+            if cascade.debug() and pk.r == 0 and l in (0, 15, 31) and pk.ids is not None:
                 self._debug_refresh(rt, pk.state, l, pk.n, pk.ids, pk.counts, total)
 
 

@@ -23,6 +23,27 @@ No vLLM imports: tested directly in fork_tests/test_layout.py.
 import torch
 
 
+def window_step(n: int, prompt_len: int, p: int) -> int:
+    """Decode steps since this request's last refresh: 0 on a refresh step.
+
+    Derived from the sequence length, not from a wall-clock step counter, so a request
+    that is not scheduled for a while keeps its place in the window instead of drifting.
+    """
+    return (n - prompt_len - 1) % p
+
+
+def selection_step(p: int, gap: int) -> int:
+    """The window step the selection runs on, `gap` steps before the refresh at 0.
+
+    gap=0 puts it on the refresh step itself (select and swap in one step). A selection
+    taken at this step is installed at the next step where window_step() == 0, which is
+    exactly `gap` decode steps later -- both are measured in the same sequence length, so
+    the distance holds even if the request is descheduled in between.
+    """
+    assert 0 <= gap < p, f"gap {gap} must be in [0, p={p})"
+    return (p - gap) % p
+
+
 def group_block_table(block_table: torch.Tensor, groups: int) -> torch.Tensor:
     """[rows, blocks] interleaved by group -> [groups * rows, blocks // groups], group-major rows."""
     rows, blocks = block_table.shape
