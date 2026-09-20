@@ -54,6 +54,7 @@ class PinnedPool:
         self.dtype = dtype
         self._free: dict[int, list[torch.Tensor]] = {}
         self._lock = threading.Lock()
+        self._bases: dict[int, torch.Tensor] = {}     # data_ptr -> the full buffer a slice was cut from
         self.allocated_rows = 0
         self.allocated_bytes = 0        # buffers are never freed, so this is the pool's footprint
 
@@ -67,12 +68,19 @@ class PinnedPool:
                     return buf[:rows]
             self.allocated_rows += rows
             self.allocated_bytes += rows * cols * torch.empty((), dtype=self.dtype).element_size()
-        return torch.empty(rows, cols, dtype=self.dtype, pin_memory=True)[:rows]
+        buf = torch.empty(rows, cols, dtype=self.dtype, pin_memory=True)
+        with self._lock:
+            self._bases[buf.data_ptr()] = buf
+        return buf[:rows]
 
     def release(self, view: torch.Tensor) -> None:
-        """Give back the buffer a view was cut from (`._base` when it is a slice)."""
-        buf = view._base if view._base is not None else view
+        """Give back the FULL buffer a slice was cut from. It is found by data pointer, NOT by
+        `view._base`: tensors created under torch.inference_mode() (which is how the engine runs) have
+        no _base, so the old lookup filed the slice back, each release shrank the buffer's capacity, and
+        every job ended up allocating a new one -- the device pool grew ~0.75 MiB per job until the GPU
+        ran out. Slices here always start at row 0, so the slice's pointer is the buffer's."""
         with self._lock:
+            buf = self._bases[view.data_ptr()]
             self._free.setdefault(buf.shape[1], []).append(buf)
 
 
@@ -88,6 +96,7 @@ class DevicePool:
         self.dtype, self.device = dtype, device
         self._free: dict[int, list[tuple[torch.Tensor, torch.cuda.Event | None]]] = {}
         self._lock = threading.Lock()
+        self._bases: dict[int, torch.Tensor] = {}     # data_ptr -> the full buffer (see PinnedPool.release)
         self.allocated_rows = 0
         self.allocated_bytes = 0        # GPU memory held by the pool; NOT part of vLLM's KV-cache budget
 
@@ -101,11 +110,14 @@ class DevicePool:
                     return buf[:rows]
             self.allocated_rows += rows
             self.allocated_bytes += rows * cols * torch.empty((), dtype=self.dtype).element_size()
-        return torch.empty(rows, cols, dtype=self.dtype, device=self.device)[:rows]
+        buf = torch.empty(rows, cols, dtype=self.dtype, device=self.device)
+        with self._lock:
+            self._bases[buf.data_ptr()] = buf
+        return buf[:rows]
 
     def release(self, view: torch.Tensor, event: torch.cuda.Event | None) -> None:
-        buf = view._base if view._base is not None else view
         with self._lock:
+            buf = self._bases[view.data_ptr()]        # by pointer, not view._base: see PinnedPool.release
             self._free.setdefault(buf.shape[1], []).append((buf, event))
 
 
