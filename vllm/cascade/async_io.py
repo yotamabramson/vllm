@@ -55,6 +55,7 @@ class PinnedPool:
         self._free: dict[int, list[torch.Tensor]] = {}
         self._lock = threading.Lock()
         self.allocated_rows = 0
+        self.allocated_bytes = 0        # buffers are never freed, so this is the pool's footprint
 
     def acquire(self, rows: int, cols: int) -> torch.Tensor:
         rows = max(rows, 1)
@@ -65,6 +66,7 @@ class PinnedPool:
                     bucket.pop(i)
                     return buf[:rows]
             self.allocated_rows += rows
+            self.allocated_bytes += rows * cols * torch.empty((), dtype=self.dtype).element_size()
         return torch.empty(rows, cols, dtype=self.dtype, pin_memory=True)[:rows]
 
     def release(self, view: torch.Tensor) -> None:
@@ -87,6 +89,7 @@ class DevicePool:
         self._free: dict[int, list[tuple[torch.Tensor, torch.cuda.Event | None]]] = {}
         self._lock = threading.Lock()
         self.allocated_rows = 0
+        self.allocated_bytes = 0        # GPU memory held by the pool; NOT part of vLLM's KV-cache budget
 
     def acquire(self, rows: int, cols: int) -> torch.Tensor:
         rows = max(rows, 1)
@@ -97,6 +100,7 @@ class DevicePool:
                     bucket.pop(i)
                     return buf[:rows]
             self.allocated_rows += rows
+            self.allocated_bytes += rows * cols * torch.empty((), dtype=self.dtype).element_size()
         return torch.empty(rows, cols, dtype=self.dtype, device=self.device)[:rows]
 
     def release(self, view: torch.Tensor, event: torch.cuda.Event | None) -> None:
@@ -182,6 +186,13 @@ class AsyncIO:
                 finally:
                     self.jobs_done += 1
                     self._queue.task_done()
+                    if self.jobs_done % 512 == 0:
+                        # The device pool is GPU memory vLLM does not know about: its KV cache was
+                        # sized to a fraction of the card BEFORE this pool existed, so whatever it
+                        # grows to has to fit in the leftover headroom. It only ever grows.
+                        logger.info("cascade: async pools after %d jobs: device %.0f MiB (unbudgeted GPU), "
+                                    "pinned host %.0f MiB", self.jobs_done, self.dev_pool.allocated_bytes / 2**20,
+                                    (self.host_pool.allocated_bytes + self.id_pool.allocated_bytes) / 2**20)
 
     def drain(self) -> None:
         """Wait until every submitted job has run (used on fallback batches and teardown)."""
